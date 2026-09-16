@@ -1,0 +1,39 @@
+# ============================================================
+#  只有下面这些不传，其余全部上传
+# ============================================================
+
+# ---------- 1. 密钥（绝对不能传）----------
+.secret_key
+.env
+.env.*
+*.pem
+*.key
+
+# ---------- 2. 你的个人数据 / 运行记录 ----------
+# 保留在本机，不上传（以后聊天记录也不会被误传上去）
+chat_contexts.json
+unsent_replies.log
+recurring_reminders.json
+CoreMemory/
+Memory_Temp/
+Theater/
+rollpig_data/
+forum_data/
+starrail/data/bindings.json
+*.log
+
+# ---------- 3. Python 缓存 ----------
+__pycache__/
+*.py[cod]
+
+# ---------- 4. 付费组件：wxautox4 是 wxauto 的付费版，公开仓库不宜分发 ----------
+# （libs 里其余都是 PyPI 上的开源包，正常上传；想连它一起传就删掉下面这行）
+libs/wxautox4_wechatbot-*.whl
+*.qkdownloading
+
+# ---------- 5. 编辑器 ----------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

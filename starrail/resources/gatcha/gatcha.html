@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Gatcha</title>
+    <link rel="stylesheet" href="{{pluResPath}}/gatcha/gatcha.css">
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <img style="width: 320px" src="{{pluResPath}}/common/cont/logo.png"/>
+        <div style="margin-left: 25px">
+            <span>
+            跃迁统计
+        </span>
+
+            <div class="uid" style="font-size: 20px;font-weight: bold">
+                {{typeName}}
+            </div>
+<!--            <div class="uid" style="font-size: 16px">-->
+<!--                uid {{uid}}-->
+<!--            </div>-->
+        </div>
+    </div>
+    <div class="general">
+        <div class="title">
+            <img src="{{pluResPath}}/common/cont/star.png"  style="width: 36px">
+            <div>数据总览</div>
+
+        </div>
+        <div class="general">
+            <div class="general-inner">
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{total}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        跃迁次数
+                    </div>
+                </div>
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{rarity5Num}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        五星数量
+                    </div>
+                </div>
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{rarity5Rate}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        五星比例
+                    </div>
+                </div>
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{rarity4Num}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        四星数量
+                    </div>
+                </div>
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{rarity4Rate}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        四星比例
+                    </div>
+                </div>
+                <div class="general-inner-block">
+                    <div class="general-inner-block-value">
+                        {{rarity5Until}}
+                    </div>
+                    <div class="general-inner-block-title">
+                        自上次五星已过
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="title">
+            <img src="{{pluResPath}}/common/cont/star.png"  style="width: 36px">
+            <div>跃迁详情</div>
+        </div>
+        <div class="general">
+            <div class="general-inner">
+                {{each events event}}
+                <div class="rarity5">
+                    <img class="item-bg" src="{{event.url}}"/>
+                    <div class="item-banner">
+                        <span>
+                             {{event.name}} {{event.until}}
+                        </span>
+                    </div>
+                    <div class="item-banner-2">
+                        <span>
+                             {{event.time}}
+                        </span>
+                    </div>
+                </div>
+                {{/each}}
+            </div>
+        </div>
+    </div>
+    <div class="logo">
+        Created By Yunzai-Bot & StarRail-plugin
+    </div>
+
+</div>
+</body>
+</html>
