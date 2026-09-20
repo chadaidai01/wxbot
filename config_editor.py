@@ -2179,424 +2179,809 @@ def delete_core_memory(filename):
 
 
 # ===== 剧场记忆管理（每个聊天/群一个剧场，参考 HDS-Interlude 记忆分层）=====
+# ============================================================================
+# 剧场记忆：HDS-Interlude 1.0.1-beta6-rebuild 移植版（hdsi/）
+# 数据文件 Theater/hdsi.sqlite3，表结构与上游 src/database.ts 完全一致。
+# 旧版 Theater/*.json 记忆已下线：首次访问时统一归档到 Theater/_legacy_json_backup/。
+# ============================================================================
+
+_HDSI_STORY_STATUSES = ('active', 'paused', 'archived')
+_HDSI_PRESENCE_STATUSES = ('present', 'off-scene', 'expected')
+_HDSI_AGENCY_LOADS = ('free', 'occupied', 'overloaded')
+_HDSI_AGENCY_PRIVACY = ('private', 'shared', 'public')
+_HDSI_AGENCY_DEVICES = ('available', 'limited', 'unavailable')
+_HDSI_FACT_SCOPES = ('character', 'world', 'relationship', 'event', 'promise')
+_HDSI_MEMORY_CATEGORIES = ('event', 'relationship', 'character', 'world', 'promise', 'preference', 'summary')
+_HDSI_INTENT_TYPES = ('delayed-reply', 'reminder', 'followup', 'promise', 'proactive-check',
+                      'cross-conversation-message', 'split-message', 'browser', 'active-consequence')
+_HDSI_PURGE_TABLES = ('interlude_script_entry', 'interlude_memory', 'interlude_intent',
+                      'interlude_scene', 'interlude_arc', 'interlude_fact',
+                      'interlude_state_patch', 'interlude_overlay_snapshot',
+                      'interlude_web_observation', 'interlude_schedule_preplan',
+                      'interlude_participant')
+
+_hdsi_db = None
+_hdsi_db_lock = __import__('threading').Lock()
+_hdsi_legacy_archived = False
+
+
 def _theater_dir():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Theater')
+    return os.path.join(BASE_DIR, 'Theater')
 
 
-STORY_SUMMARY_MAX = 10   # 与 theater.py 保持一致：前情摘要最多保留条数
+def _hdsi_db_path():
+    return os.path.join(_theater_dir(), 'hdsi.sqlite3')
 
 
-def _theater_sanitize(name):
-    return re.sub(r'[\\/:*?"<>|\s]', '_', str(name))
+def _get_hdsi_db():
+    """惰性打开 hdsi.sqlite3（与 bot 进程共用同一文件，WAL 并发安全）。"""
+    global _hdsi_db
+    with _hdsi_db_lock:
+        if _hdsi_db is None:
+            import sys as _sys
+            if BASE_DIR not in _sys.path:
+                _sys.path.insert(0, BASE_DIR)
+            from hdsi.store import Database
+            os.makedirs(_theater_dir(), exist_ok=True)
+            _hdsi_db = Database(_hdsi_db_path())
+        return _hdsi_db
 
 
-def _theater_path(name):
-    safe = _theater_sanitize(name)
-    return os.path.join(_theater_dir(), f'{safe}.json')
-
-
-def _load_theater(name):
-    p = _theater_path(name)
-    if not os.path.exists(p):
-        return None
+def _archive_legacy_theater_memory():
+    """旧版 JSON 剧场记忆下线：归档到 Theater/_legacy_json_backup/（不删除数据）。"""
+    global _hdsi_legacy_archived
+    if _hdsi_legacy_archived:
+        return
+    _hdsi_legacy_archived = True
     try:
-        with open(p, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        app.logger.error(f"读取剧场 {name} 失败: {e}")
+        d = _theater_dir()
+        if not os.path.isdir(d):
+            return
+        files = [f for f in os.listdir(d) if f.endswith('.json') and not f.endswith('.tmp')]
+        if not files:
+            return
+        backup = os.path.join(d, '_legacy_json_backup')
+        os.makedirs(backup, exist_ok=True)
+        for fn in files:
+            source = os.path.join(d, fn)
+            target = os.path.join(backup, fn)
+            if os.path.exists(target):
+                target = os.path.join(backup, '%d_%s' % (int(time.time()), fn))
+            shutil.move(source, target)
+        app.logger.info('已归档 %d 个旧版剧场 JSON 到 %s', len(files), backup)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning('归档旧版剧场 JSON 失败: %s', e)
+
+
+def _hdsi_jsonable(value):
+    if isinstance(value, dict):
+        return {key: _hdsi_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_hdsi_jsonable(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _hdsi_now():
+    from datetime import timezone as _tz
+    return datetime.now(_tz.utc)
+
+
+def _hdsi_iso(value):
+    utc = value.astimezone(__import__('datetime').timezone.utc) if value.tzinfo else value
+    return utc.strftime('%Y-%m-%dT%H:%M:%S.') + '%03dZ' % (utc.microsecond // 1000)
+
+
+def _hdsi_story_row(sid):
+    rows = _get_hdsi_db().get('interlude_story', {'id': sid})
+    return rows[0] if rows else None
+
+
+def _hdsi_story_counts(sid):
+    db = _get_hdsi_db()
+    tables = ('interlude_script_entry', 'interlude_memory', 'interlude_fact', 'interlude_intent',
+              'interlude_scene', 'interlude_arc', 'interlude_state_patch',
+              'interlude_overlay_snapshot', 'interlude_web_observation')
+    names = ('entries', 'memories', 'facts', 'intents', 'scenes', 'arcs',
+             'patches', 'snapshots', 'observations')
+    return {name: db.count(table, {'storyId': sid}) for name, table in zip(names, tables)}
+
+
+def _hdsi_story_bundle(sid):
+    db = _get_hdsi_db()
+    story = _hdsi_story_row(sid)
+    if not story:
         return None
+    participants = db.get('interlude_participant', {'storyId': sid}, {'sort': {'updatedAt': 'desc'}})
+    scenes = db.get('interlude_scene', {'storyId': sid}, {'sort': {'startedAt': 'desc'}, 'limit': 30})
+    arcs = db.get('interlude_arc', {'storyId': sid}, {'sort': {'updatedAt': 'desc'}, 'limit': 10})
+    patches = db.get('interlude_state_patch', {'storyId': sid}, {'sort': {'createdAt': 'desc'}, 'limit': 80})
+    snapshots = db.get('interlude_overlay_snapshot', {'storyId': sid}, {'sort': {'periodEnd': 'desc'}, 'limit': 30})
+    preplan_rows = db.get('interlude_schedule_preplan', {'storyId': sid})
+    return _hdsi_jsonable({
+        'story': {**story, 'counts': _hdsi_story_counts(sid)},
+        'participants': participants,
+        'scenes': scenes,
+        'arcs': arcs,
+        'patches': patches,
+        'snapshots': snapshots,
+        'preplan': preplan_rows[0] if preplan_rows else None,
+    })
 
 
-def _empty_theater(name):
-    """新建剧场的初始状态（与 theater.py 的 _new_state 保持一致）。"""
-    return {
-        'theater_id': name,
-        'canon': {'character': '', 'world': '', 'scene': '', 'script_brief': ''},
-        'participants': {}, 'script': [], 'threads': [], 'long_term': [],
-        'overlays': [], 'perspective': '', 'consequences': [], 'continuity': {},
-        'intents': [],
-        'mood': {'alter': 0, 'cumulative': 0, 'description': '', 'weight': 0,
-                 'direction': None, 'recent': [], 'last_analysis_ts': 0},
-        'last_proactive': {}, 'turns_since_refresh': 0, 'last_advance': 0.0, 'updated_at': 0.0,
-        # HDS-Interlude 0.1.4 对齐字段
-        'story_summary': [], 'presence': [], 'delivered_summary': [],
-        'agency': {},
-        'preplan': {'version': 0, 'reviewed_date': '', 'reviewed_ts': 0,
-                    'next_review_ts': 0, 'note': '', 'regimes': [], 'exceptions': []},
-        'last_user': '', 'last_user_ts': 0.0, 'last_followup_ts': 0.0, 'followup_done': {},
-    }
+def _hdsi_merge_setting(setting, patch):
+    out = dict(setting or {})
+    for key, value in (patch or {}).items():
+        if value is None:
+            continue
+        if key in ('character', 'user') and isinstance(value, dict):
+            merged = dict(out.get(key) or {})
+            for sub_key, sub_value in value.items():
+                if sub_value is None:
+                    continue
+                merged[sub_key] = str(sub_value)
+            out[key] = merged
+        else:
+            out[key] = str(value)
+    return out
 
 
-@app.route('/api/theaters', methods=['GET'])
+@app.route('/api/hdsi/stories', methods=['GET'])
 @login_required
-def api_list_theaters():
-    d = _theater_dir()
-    result = []
+def api_hdsi_stories():
+    _archive_legacy_theater_memory()
     try:
-        if os.path.isdir(d):
-            for fn in sorted(os.listdir(d)):
-                if not fn.endswith('.json') or fn.endswith('.tmp'):
-                    continue
-                name = fn[:-5]
-                data = _load_theater(name)
-                if data is None:
-                    continue
-                result.append({
-                    'name': name,
-                    'scene': (data.get('canon') or {}).get('scene', ''),
-                    'participants': list((data.get('participants') or {}).keys()),
-                    'script_entries': len(data.get('script') or []),
-                    'threads': len(data.get('threads') or []),
-                    'long_term': len(data.get('long_term') or []),
-                    'overlays': len(data.get('overlays') or []),
-                    'intents': len([i for i in (data.get('intents') or []) if not i.get('done')]),
-                    'updated_at': data.get('updated_at', 0),
-                })
-    except Exception as e:
-        app.logger.error(f"列出剧场失败: {e}")
+        db = _get_hdsi_db()
+        stories = db.get('interlude_story', {}, {'sort': {'updatedAt': 'desc'}, 'limit': 100})
+        result = []
+        for story in stories:
+            sid = story.get('id')
+            setting = story.get('setting') or {}
+            character = setting.get('character') or {}
+            participants = db.get('interlude_participant', {'storyId': sid}, {'limit': 200})
+            active_scenes = db.get('interlude_scene', {'storyId': sid, 'status': 'active'}, {'limit': 1})
+            result.append(_hdsi_jsonable({
+                'id': sid,
+                'status': story.get('status'),
+                'characterName': character.get('name') or '未命名角色',
+                'platform': story.get('platform'),
+                'selfId': story.get('selfId'),
+                'participantCount': len(participants),
+                'participants': [p.get('displayName') or p.get('userId') or '' for p in participants[:8]],
+                'scene': (active_scenes[0].get('hook') if active_scenes else '') or '',
+                'updatedAt': story.get('updatedAt'),
+                'cursorAt': story.get('cursorAt'),
+                'counts': _hdsi_story_counts(sid),
+            }))
+        return jsonify({'success': True, 'stories': result})
+    except Exception as e:  # noqa: BLE001
+        app.logger.error('列出剧场失败: %s', e)
         return jsonify({'success': False, 'message': str(e)}), 500
-    return jsonify({'success': True, 'theaters': result})
 
 
-@app.route('/api/theater/<name>', methods=['GET'])
+@app.route('/api/hdsi/stories', methods=['POST'])
 @login_required
-def api_get_theater(name):
-    if '/' in name or '..' in name:
-        return jsonify({'success': False, 'message': '非法名称'}), 400
-    data = _load_theater(name)
-    if data is None:
-        return jsonify({'success': False, 'message': f'剧场 {name} 不存在'}), 404
-    return jsonify({'success': True, 'theater': data})
-
-
-@app.route('/api/theater/<name>', methods=['POST'])
-@login_required
-def api_save_theater(name):
-    if '/' in name or '..' in name:
-        return jsonify({'success': False, 'message': '非法名称'}), 400
-    data = _load_theater(name)
-    if data is None:
-        data = _empty_theater(name)  # 不存在则新建（网页端"新建剧场"）
+def api_hdsi_story_create():
     payload = request.get_json(silent=True) or {}
-    now = time.time()
-
-    def _split_lines(text):
-        return [ln.strip() for ln in (str(text or '').splitlines()) if ln.strip()]
-
-    # ---- 单一动作类（清空 / 重置 / 清层） ----
-    if payload.get('script_clear'):
-        data['script'] = []
-    if payload.get('story_summary_clear'):
-        data['story_summary'] = []
-    if 'story_summary_text' in payload:
-        # 手动编辑"前情摘要"：每行一条（按时间顺序，最旧在前）。保留原始时间/条目数的语义已不精确，
-        # 这里对编辑后的行统一刷新 ts、count 记 0（仅用于展示"原 N 条"徽标，无功能影响）。
-        _ss_lines = [ln.strip() for ln in str(payload.get('story_summary_text') or '').splitlines() if ln.strip()]
-        data['story_summary'] = [{'ts': now, 'text': ln, 'count': 0} for ln in _ss_lines][-STORY_SUMMARY_MAX:]
-    if payload.get('preplan_clear'):
-        pp = data.setdefault('preplan', {})
-        pp['regimes'] = []
-        pp['exceptions'] = []
-    if payload.get('overlay_clear_layer'):
-        layer = str(payload['overlay_clear_layer'])
-        if layer in ('character', 'world', 'relationship'):
-            data['overlays'] = [o for o in (data.get('overlays') or []) if o.get('layer') != layer]
-
-    # ---- 意图管理（增/删/标记完成） ----
-    if isinstance(payload.get('intents_delete'), list):
-        idxs = []
-        for i in payload['intents_delete']:
-            try: idxs.append(int(i))
-            except Exception: pass
-        idxs = sorted(set(idxs), reverse=True)
-        intents = data.get('intents') or []
-        for i in idxs:
-            if 0 <= i < len(intents):
-                intents.pop(i)
-        data['intents'] = intents
-    if isinstance(payload.get('intents_mark_done'), list):
-        intents = data.get('intents') or []
-        for i in payload['intents_mark_done']:
-            try: idx = int(i)
-            except Exception: continue
-            if 0 <= idx < len(intents):
-                intents[idx]['done'] = True
-        data['intents'] = intents
-    if isinstance(payload.get('intents_add'), list):
-        intents = data.get('intents') or []
-        for it in payload['intents_add']:
-            if not isinstance(it, dict):
-                continue
-            typ = str(it.get('type') or '')
-            if typ not in ('reminder', 'delayed_reply', 'followup', 'promise'):
-                continue
-            content = str(it.get('content') or '').strip()
-            if not content:
-                continue
-            try:
-                mins = int(it.get('when_min') or 30)
-            except Exception:
-                mins = 30
-            intents.append({
-                'type': typ, 'target_ts': now + max(1, mins) * 60,
-                'target_user': str(it.get('target_user') or '').strip(),
-                'content': content, 'done': False, 'attempts': 0,
-            })
-        data['intents'] = intents
-    if payload.get('clear_done_intents'):
-        data['intents'] = [i for i in (data.get('intents') or []) if not i.get('done')]
-
-    # ---- 运行元数据重置 ----
-    if payload.get('runtime_reset'):
-        action = str(payload['runtime_reset'])
-        if action == 'advance':
-            data['last_advance'] = 0.0
-        elif action == 'all':
-            data['last_advance'] = 0.0
-            data['last_user_ts'] = 0.0
-            data['last_followup_ts'] = 0.0
-            data['last_bubble_ts'] = 0.0
-            data['followup_done'] = {}
-            data['turns_since_refresh'] = 0
-
-    # ---- Canon + Perspective（原有） ----
-    canon = data.setdefault('canon', {})
-    if 'world' in payload:
-        canon['world'] = str(payload.get('world') or '')
-    if 'scene' in payload:
-        canon['scene'] = str(payload.get('scene') or '')
-    if 'script_brief' in payload:
-        canon['script_brief'] = str(payload.get('script_brief') or '')
-    if 'character' in payload:
-        canon['character'] = str(payload.get('character') or '')
-    if 'perspective' in payload:
-        data['perspective'] = str(payload.get('perspective') or '')
-
-    # ---- Memory：剧情引子 / 长期事实（原有） ----
-    if 'threads_text' in payload:
-        data['threads'] = _split_lines(payload.get('threads_text'))[:20]
-    if 'long_term_text' in payload:
-        data['long_term'] = _split_lines(payload.get('long_term_text'))[:60]
-
-    # ---- Overlay（原有，已会覆盖整层数组） ----
-    if 'overlays_text' in payload:
-        ov = []
-        for ln in _split_lines(payload.get('overlays_text')):
-            parts = [p.strip() for p in ln.split('|')]
-            layer = parts[0] if parts and parts[0] in ('character', 'world', 'relationship') else 'character'
-            target = parts[1] if len(parts) > 1 else ''
-            desc = parts[2] if len(parts) > 2 else ln
-            ov.append({'layer': layer, 'target': target, 'description': desc, 'ts': now})
-        data['overlays'] = ov[:30]
-
-    # ---- 参与者（原有） ----
-    if 'participants_text' in payload:
-        parts_map = {}
-        for ln in _split_lines(payload.get('participants_text')):
-            seg = [s.strip() for s in ln.split('|')]
-            if not seg[0]:
-                continue
-            parts_map[seg[0]] = {
-                'profile': seg[1] if len(seg) > 1 else '',
-                'relation': seg[2] if len(seg) > 2 else '',
-                'relation_evolution': seg[3] if len(seg) > 3 else '',
-                'arc': seg[4] if len(seg) > 4 else '',
-                'last_seen_ts': (data.get('participants', {}).get(seg[0], {}) or {}).get('last_seen_ts', 0),
-            }
-        data['participants'] = parts_map
-
-    # ---- 新增：Continuity 低频状态摘要 ----
-    if isinstance(payload.get('continuity'), dict):
-        c = payload['continuity']
-        data['continuity'] = {
-            'current': str(c.get('current') or ''),
-            'next': [str(x) for x in (c.get('next') or [])][:6],
-            'recent': [str(x) for x in (c.get('recent') or [])][:8],
-            'salient': [str(x) for x in (c.get('salient') or [])][:6],
-        }
-
-    # ---- 新增：Consequences 剧情余波 ----
-    if 'consequences_text' in payload:
-        cs = []
-        for ln in _split_lines(payload.get('consequences_text')):
-            parts = [p.strip() for p in ln.split('|')]
-            eff = parts[0] if parts else ''
-            if not eff:
-                continue
-            try:
-                strength = max(0.0, min(1.0, float(parts[1]))) if len(parts) > 1 and parts[1] else 0.5
-            except Exception:
-                strength = 0.5
-            try:
-                mins = int(parts[2]) if len(parts) > 2 and parts[2] else 60
-            except Exception:
-                mins = 60
-            cs.append({'effect': eff, 'strength': strength,
-                       'ts': now, 'expires_ts': now + max(1, mins) * 60})
-        data['consequences'] = cs[:15]
-
-    # ---- 新增：Mood / Alter 氛围惯性（部分更新） ----
-    if isinstance(payload.get('mood'), dict):
-        m = payload['mood']
-        cur = data.setdefault('mood', {'alter': 0, 'cumulative': 0, 'description': '',
-                                       'weight': 0, 'direction': None, 'recent': [],
-                                       'last_analysis_ts': 0})
-        if 'cumulative' in m:
-            try: cur['cumulative'] = int(m['cumulative'])
-            except Exception: pass
-        if 'description' in m:
-            cur['description'] = str(m['description'] or '')
-        if 'weight' in m:
-            try: cur['weight'] = float(m['weight'])
-            except Exception: pass
-        if 'direction' in m:
-            v = m['direction']
-            if v is None or v == '':
-                cur['direction'] = None
-            else:
-                try: cur['direction'] = 1 if int(v) > 0 else -1
-                except Exception: pass
-
-    # ---- 新增：Agency Window 行动条件 ----
-    if isinstance(payload.get('agency'), dict):
-        a = payload['agency']
-        load = str(a.get('activityLoad') or '')
-        priv = str(a.get('privacy') or '')
-        dev = str(a.get('deviceAccess') or '')
-        if (load in ('free', 'occupied', 'overloaded') and
-                priv in ('private', 'shared', 'public') and
-                dev in ('available', 'limited', 'unavailable')):
-            try:
-                mins = max(15, min(1440, int(a.get('validMinutes') or 120)))
-            except Exception:
-                mins = 120
-            data['agency'] = {
-                'activityLoad': load, 'privacy': priv, 'deviceAccess': dev,
-                'valid_until': now + mins * 60,
-                'basis': str(a.get('basis') or '')[:80], 'updated_at': now,
-            }
-
-    # ---- 新增：在场表 Presence ----
-    if 'presence_text' in payload:
-        pr = []
-        for ln in _split_lines(payload.get('presence_text')):
-            parts = [p.strip() for p in ln.split('|')]
-            nm = parts[0] if parts else ''
-            if not nm:
-                continue
-            status = parts[1] if len(parts) > 1 else 'present'
-            if status not in ('present', 'left', 'joining'):
-                status = 'present'
-            note = parts[2] if len(parts) > 2 else ''
-            pr.append({'name': nm[:20], 'status': status, 'note': note[:40]})
-        data['presence'] = pr[:8]
-
-    # ---- 新增：Schedule Preplan（周规律 + 日期例外） ----
-    if isinstance(payload.get('preplan'), dict):
-        pp_input = payload['preplan']
-        pp = data.setdefault('preplan', {})
-        allowed_types = ('fixed', 'routine', 'flexible', 'open')
-
-        def _clean_blocks(blocks):
-            out = []
-            if not isinstance(blocks, list):
-                return out
-            for b in blocks[:6]:
-                if not isinstance(b, dict):
-                    continue
-                s = str(b.get('start') or '')
-                e = str(b.get('end') or '')
-                if not re.match(r'^\d{1,2}:\d{2}$', s) or not re.match(r'^\d{1,2}:\d{2}$', e):
-                    continue
-                typ = str(b.get('type') or '')
-                if typ not in allowed_types:
-                    continue
-                label = str(b.get('label') or '')[:40]
-                if not label:
-                    continue
-                out.append({'type': typ, 'start': s, 'end': e, 'label': label})
-            return out
-
-        if isinstance(pp_input.get('regimes'), list):
-            regimes = []
-            for r in pp_input['regimes'][:5]:
-                if not isinstance(r, dict):
-                    continue
-                days = []
-                for d in (r.get('days') or []):
-                    try: di = int(d)
-                    except Exception: continue
-                    if 1 <= di <= 7 and di not in days:
-                        days.append(di)
-                blocks = _clean_blocks(r.get('blocks'))
-                if days and blocks:
-                    regimes.append({'days': days, 'blocks': blocks})
-            pp['regimes'] = regimes
-        if isinstance(pp_input.get('exceptions'), list):
-            exceptions = []
-            for e in pp_input['exceptions'][:10]:
-                if not isinstance(e, dict):
-                    continue
-                d = str(e.get('date') or '')
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
-                    continue
-                blocks = _clean_blocks(e.get('blocks'))
-                if blocks:
-                    exceptions.append({'date': d, 'blocks': blocks})
-            pp['exceptions'] = exceptions
-
+    sid = str(payload.get('id') or '').strip() or ('manual:%s' % uuid.uuid4().hex[:12])
+    if '/' in sid or '..' in sid:
+        return jsonify({'success': False, 'message': '非法故事 ID'}), 400
+    db = _get_hdsi_db()
+    if db.get('interlude_story', {'id': sid}):
+        return jsonify({'success': False, 'message': '该故事 ID 已存在'}), 400
     try:
-        os.makedirs(_theater_dir(), exist_ok=True)
-        p = _theater_path(name)
-        tmp_path = p + '.tmp'
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, p)
-    except Exception as e:
-        app.logger.error(f"保存剧场 {name} 失败: {e}")
-        return jsonify({'success': False, 'message': f'保存失败: {str(e)}'}), 500
-    return jsonify({'success': True, 'message': f'剧场《{name}》记忆已保存', 'theater': data})
+        import sys as _sys
+        if BASE_DIR not in _sys.path:
+            _sys.path.insert(0, BASE_DIR)
+        from hdsi.config_model import resolve_config
+        from hdsi.types import empty_story_setting, empty_story_state
+        defaults = resolve_config({}).get('storyDefaults') or {}
+        setting = empty_story_setting()
+        setting['character']['name'] = str(payload.get('name') or defaults.get('characterName') or '未命名角色')
+        setting['character']['profile'] = str(defaults.get('characterProfile') or '')
+        setting['user']['profile'] = str(defaults.get('userProfile') or '')
+        for field in ('relationship', 'world', 'perspective', 'supportingCast', 'location', 'style', 'timezone'):
+            if defaults.get(field):
+                setting[field] = defaults[field]
+        now = _hdsi_now()
+        db.create('interlude_story', {
+            'id': sid, 'platform': 'manual', 'selfId': '', 'userId': '', 'channelId': '',
+            'status': 'active', 'setting': setting, 'state': empty_story_state(),
+            'cursorAt': now, 'createdAt': now, 'updatedAt': now,
+        })
+        return jsonify({'success': True, 'id': sid})
+    except Exception as e:  # noqa: BLE001
+        app.logger.error('手动创建剧场失败: %s', e)
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
-@app.route('/api/theater/<name>/script', methods=['GET'])
+@app.route('/api/hdsi/story/<sid>', methods=['GET'])
 @login_required
-def api_get_theater_script(name):
-    """分页读取剧场剧本（倒序：最新在前）。"""
-    if '/' in name or '..' in name:
-        return jsonify({'success': False, 'message': '非法名称'}), 400
-    data = _load_theater(name)
-    if data is None:
-        return jsonify({'success': False, 'message': f'剧场 {name} 不存在'}), 404
+def api_hdsi_story_get(sid):
+    if '/' in sid or '..' in sid:
+        return jsonify({'success': False, 'message': '非法故事 ID'}), 400
+    _archive_legacy_theater_memory()
+    bundle = _hdsi_story_bundle(sid)
+    if bundle is None:
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    return jsonify({'success': True, **bundle})
+
+
+@app.route('/api/hdsi/story/<sid>', methods=['POST'])
+@login_required
+def api_hdsi_story_update(sid):
+    if '/' in sid or '..' in sid:
+        return jsonify({'success': False, 'message': '非法故事 ID'}), 400
+    db = _get_hdsi_db()
+    story = _hdsi_story_row(sid)
+    if not story:
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    payload = request.get_json(silent=True) or {}
+    now = _hdsi_now()
+    setting = dict(story.get('setting') or {})
+    state = dict(story.get('state') or {})
+    story_patch = {'updatedAt': now}
+    setting_changed = False
+
+    # ---- 设定（Canon）----
+    if isinstance(payload.get('setting'), dict):
+        setting = _hdsi_merge_setting(setting, payload['setting'])
+        story_patch['setting'] = setting
+        setting_changed = True
+
+    # ---- 设定演化层（settingOverlay）----
+    overlay = dict(state.get('settingOverlay') or {})
+    overlay_touched = False
+    if isinstance(payload.get('settingOverlay'), dict):
+        for key, value in payload['settingOverlay'].items():
+            if key == 'characterTraits':
+                if isinstance(value, list):
+                    traits = value
+                else:
+                    traits = [line.strip() for line in str(value or '').splitlines() if line.strip()]
+                overlay['characterTraits'] = [str(item).strip()[:500] for item in traits if str(item).strip()][:50]
+            elif value is not None:
+                overlay[key] = str(value)[:4000]
+        overlay_touched = True
+    clear_target = str(payload.get('settingOverlayClear') or '')
+    if clear_target:
+        if clear_target in ('character', 'all'):
+            overlay.pop('characterProfile', None)
+            overlay.pop('characterTraits', None)
+        if clear_target in ('perspective', 'all'):
+            overlay.pop('perspective', None)
+        if clear_target in ('relationship', 'all'):
+            overlay.pop('relationship', None)
+        if clear_target in ('world', 'all'):
+            overlay.pop('world', None)
+        if clear_target in ('supportingCast', 'all'):
+            overlay.pop('supportingCast', None)
+        if clear_target in ('location', 'all'):
+            overlay.pop('location', None)
+        overlay_touched = True
+    if overlay_touched:
+        state['settingOverlay'] = overlay
+
+    # ---- Continuity 摘要 ----
+    if 'continuity' in payload:
+        cont = payload.get('continuity')
+        if isinstance(cont, dict):
+            state['continuitySnapshot'] = {
+                'current': str(cont.get('current') or '')[:500],
+                'next': [str(item)[:300] for item in (cont.get('next') or []) if str(item).strip()][:5],
+                'recent': [str(item)[:300] for item in (cont.get('recent') or []) if str(item).strip()][:5],
+                'salient': [str(item)[:400] for item in (cont.get('salient') or []) if str(item).strip()][:5],
+            }
+        else:
+            state.pop('continuitySnapshot', None)
+
+    # ---- automation（推进时钟）----
+    automation = dict(state.get('automation') or {})
+    automation_touched = False
+    if isinstance(payload.get('automation'), dict):
+        for key, value in payload['automation'].items():
+            if value is None or value == '':
+                automation.pop(key, None)
+            else:
+                automation[key] = value
+        automation_touched = True
+    if payload.get('automationReset'):
+        automation = {}
+        automation_touched = True
+    runtime_reset = str(payload.get('runtimeReset') or '')
+    if runtime_reset == 'advance':
+        automation.pop('timelineRetryAt', None)
+        automation.pop('timelineRetryFrom', None)
+        automation['nextAdvanceAt'] = _hdsi_iso(now - __import__('datetime').timedelta(seconds=5))
+        automation_touched = True
+    elif runtime_reset == 'all':
+        automation = {}
+        state.pop('alterSystem', None)
+        state.pop('agencyWindow', None)
+        state.pop('chatRhythm', None)
+        state.pop('timelineCarry', None)
+        state.pop('workingDetails', None)
+        state.pop('automaticDeliverySummaries', None)
+        state.pop('sceneFrame', None)
+        state.pop('dialogueBurst', None)
+        automation_touched = True
+    if automation_touched:
+        if automation:
+            state['automation'] = automation
+        else:
+            state.pop('automation', None)
+
+    # ---- Alter 情绪偏移 ----
+    if isinstance(payload.get('alterSystem'), dict):
+        alter = dict(state.get('alterSystem') or {})
+        data = payload['alterSystem']
+        if data.get('clear'):
+            state.pop('alterSystem', None)
+        else:
+            if 'alterValue' in data:
+                try:
+                    alter['alterValue'] = max(-5, min(5, int(float(data['alterValue']))))
+                except Exception:  # noqa: BLE001
+                    pass
+            if 'alterWeight' in data:
+                try:
+                    alter['alterWeight'] = max(0.0, min(1.0, float(data['alterWeight'])))
+                except Exception:  # noqa: BLE001
+                    pass
+            if 'emotionalOffset' in data:
+                offset = data['emotionalOffset']
+                if isinstance(offset, dict):
+                    direction = 'serious' if str(offset.get('direction')) == 'serious' else 'relaxed'
+                    description = str(offset.get('description') or '').strip()[:400]
+                    if description:
+                        try:
+                            intensity = max(1.0, min(3.0, float(offset.get('intensity') or 1.0)))
+                        except Exception:  # noqa: BLE001
+                            intensity = 1.0
+                        alter['emotionalOffset'] = {
+                            'direction': direction, 'description': description,
+                            'intensity': intensity, 'generatedAt': _hdsi_iso(now),
+                        }
+                elif offset is None:
+                    alter.pop('emotionalOffset', None)
+            if data.get('clearOffset'):
+                alter.pop('emotionalOffset', None)
+            state['alterSystem'] = alter
+
+    # ---- Agency Window 行动条件 ----
+    if 'agencyWindow' in payload:
+        window = payload.get('agencyWindow')
+        if isinstance(window, dict):
+            load = str(window.get('activityLoad') or '')
+            privacy = str(window.get('privacy') or '')
+            device = str(window.get('deviceAccess') or '')
+            if load in _HDSI_AGENCY_LOADS and privacy in _HDSI_AGENCY_PRIVACY and device in _HDSI_AGENCY_DEVICES:
+                try:
+                    minutes = max(5, min(1440, int(float(window.get('validMinutes') or 240))))
+                except Exception:  # noqa: BLE001
+                    minutes = 240
+                state['agencyWindow'] = {
+                    'activityLoad': load, 'privacy': privacy, 'deviceAccess': device,
+                    'validUntil': _hdsi_iso(now + __import__('datetime').timedelta(minutes=minutes)),
+                    'basis': str(window.get('basis') or '')[:300],
+                    'sourceEntryIds': [],
+                    'updatedAt': _hdsi_iso(now),
+                }
+        else:
+            state.pop('agencyWindow', None)
+
+    # ---- 在场表 ----
+    # 上游状态解码要求每条在场记录都有 sourceEntryIds 证据，否则会被丢弃；
+    # 网页端手工校正时挂到最近一条剧本记录上作为来源。
+    if isinstance(payload.get('scenePresence'), list):
+        latest_rows = db.get('interlude_script_entry', {'storyId': sid}, {'sort': {'id': 'desc'}, 'limit': 1})
+        latest_entry_id = latest_rows[0]['id'] if latest_rows else None
+        presence = []
+        for item in payload['scenePresence'][:8]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').strip()[:80]
+            if not name:
+                continue
+            status = item.get('status') if item.get('status') in _HDSI_PRESENCE_STATUSES else 'present'
+            source_ids = [int(x) for x in (item.get('sourceEntryIds') or []) if str(x).isdigit()][:8]
+            if not source_ids and latest_entry_id is not None:
+                source_ids = [latest_entry_id]
+            if not source_ids:
+                continue
+            presence.append({
+                'name': name, 'status': status,
+                'basis': str(item.get('basis') or '').strip()[:300] or '网页端手动编辑',
+                'sourceEntryIds': source_ids,
+                'updatedAt': _hdsi_iso(now),
+            })
+        state['scenePresence'] = presence
+    elif payload.get('scenePresenceClear'):
+        state.pop('scenePresence', None)
+
+    # ---- 手头小事（workingDetails）----
+    if isinstance(payload.get('workingDetails'), list):
+        details = []
+        for item in payload['workingDetails'][:10]:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get('label') or '').strip()[:80]
+            value = str(item.get('value') or '').strip()[:300]
+            if not label or not value:
+                continue
+            detail = {'label': label, 'value': value, 'createdAt': _hdsi_iso(now)}
+            expires = str(item.get('expiresAt') or '').strip()
+            if expires:
+                detail['expiresAt'] = expires
+            details.append(detail)
+        state['workingDetails'] = details
+
+    # ---- timelineCarry ----
+    if isinstance(payload.get('timelineCarry'), list):
+        carry = []
+        for item in payload['timelineCarry']:
+            text = str(item).strip()[:240]
+            if text and text not in carry:
+                carry.append(text)
+            if len(carry) >= 4:
+                break
+        if carry:
+            state['timelineCarry'] = carry
+        else:
+            state.pop('timelineCarry', None)
+
+    # ---- 场景 / 弧线修正 ----
+    scene_patch = payload.get('scene')
+    if isinstance(scene_patch, dict) and scene_patch.get('id') is not None:
+        try:
+            scene_id = int(scene_patch['id'])
+        except Exception:  # noqa: BLE001
+            scene_id = None
+        if scene_id is not None:
+            rows = db.get('interlude_scene', {'storyId': sid, 'id': scene_id})
+            if rows:
+                data = {}
+                if 'hook' in scene_patch:
+                    data['hook'] = str(scene_patch['hook'] or '')[:2000]
+                if 'summary' in scene_patch:
+                    data['summary'] = str(scene_patch['summary'] or '')[:8000]
+                if data:
+                    data['updatedAt'] = now
+                    db.set('interlude_scene', {'storyId': sid, 'id': scene_id}, data)
+    arc_patch = payload.get('arc')
+    if isinstance(arc_patch, dict) and arc_patch.get('id') is not None:
+        try:
+            arc_id = int(arc_patch['id'])
+        except Exception:  # noqa: BLE001
+            arc_id = None
+        if arc_id is not None:
+            rows = db.get('interlude_arc', {'storyId': sid, 'id': arc_id})
+            if rows:
+                data = {}
+                if 'title' in arc_patch:
+                    data['title'] = str(arc_patch['title'] or '')[:255]
+                if 'summary' in arc_patch:
+                    data['summary'] = str(arc_patch['summary'] or '')[:12000]
+                if data:
+                    data['updatedAt'] = now
+                    db.set('interlude_arc', {'storyId': sid, 'id': arc_id}, data)
+
+    # ---- 日程（Schedule Preplan）----
+    if payload.get('preplanClear'):
+        db.remove('interlude_schedule_preplan', {'storyId': sid})
+    elif isinstance(payload.get('preplan'), dict):
+        rows = db.get('interlude_schedule_preplan', {'storyId': sid})
+        if rows:
+            data = {}
+            if isinstance(payload['preplan'].get('regimes'), list):
+                data['regimes'] = payload['preplan']['regimes'][:5]
+            if isinstance(payload['preplan'].get('exceptions'), list):
+                data['exceptions'] = payload['preplan']['exceptions'][:10]
+            if data:
+                data['revision'] = int(rows[0].get('revision') or 0) + 1
+                data['updatedAt'] = now
+                db.set('interlude_schedule_preplan', {'storyId': sid}, data)
+    elif payload.get('preplanRebuild'):
+        rows = db.get('interlude_schedule_preplan', {'storyId': sid})
+        if rows:
+            db.set('interlude_schedule_preplan', {'storyId': sid}, {
+                'lastReviewedLocalDate': '', 'validThrough': '1970-01-01',
+                'reviewReason': 'Administrator requested a rebuild.', 'updatedAt': now,
+            })
+
+    # ---- 状态 ----
+    status = str(payload.get('status') or '')
+    if status in _HDSI_STORY_STATUSES:
+        story_patch['status'] = status
+
+    # ---- 清空剧本（危险，需 confirm）----
+    if payload.get('scriptClear') and payload.get('confirm'):
+        for table in ('interlude_script_entry', 'interlude_scene', 'interlude_arc'):
+            db.remove(table, {'storyId': sid})
+        for key in ('activeSceneId', 'activeArcId', 'continuitySnapshot', 'scenePresence',
+                    'workingDetails', 'automaticDeliverySummaries', 'timelineCarry',
+                    'sceneFrame', 'dialogueBurst'):
+            state.pop(key, None)
+        state['narrativeUpdateCount'] = 0
+        state['continuityDirty'] = True
+        story_patch['cursorAt'] = now
+
+    story_patch['state'] = state
+    if setting_changed:
+        story_patch['setting'] = setting
+    db.set('interlude_story', {'id': sid}, story_patch)
+    bundle = _hdsi_story_bundle(sid)
+    return jsonify({'success': True, 'message': '已保存', **bundle})
+
+
+@app.route('/api/hdsi/story/<sid>', methods=['DELETE'])
+@login_required
+def api_hdsi_story_delete(sid):
+    if '/' in sid or '..' in sid:
+        return jsonify({'success': False, 'message': '非法故事 ID'}), 400
+    payload = request.get_json(silent=True) or {}
+    if not payload.get('confirm'):
+        return jsonify({'success': False, 'message': '需要二次确认'}), 400
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    for table in _HDSI_PURGE_TABLES:
+        db.remove(table, {'storyId': sid})
+    db.remove('interlude_story', {'id': sid})
+    return jsonify({'success': True, 'message': '剧场已删除'})
+
+
+@app.route('/api/hdsi/story/<sid>/script', methods=['GET'])
+@login_required
+def api_hdsi_story_script(sid):
+    if '/' in sid or '..' in sid:
+        return jsonify({'success': False, 'message': '非法故事 ID'}), 400
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
     try:
         offset = max(0, int(request.args.get('offset', 0)))
-        limit = max(1, min(300, int(request.args.get('limit', 60))))
-    except Exception:
-        offset, limit = 0, 60
-    script = data.get('script') or []
-    total = len(script)
-    # 倒序分页：offset=0 取末尾 limit 条，offset=N 取倒数 (N+1)..(N+limit)
-    end = max(0, total - offset)
-    start = max(0, end - limit)
-    items = list(reversed(script[start:end]))
-    return jsonify({'success': True, 'total': total, 'offset': offset,
-                    'limit': limit, 'script': items})
+        limit = max(1, min(200, int(request.args.get('limit', 40))))
+    except Exception:  # noqa: BLE001
+        offset, limit = 0, 40
+    kind = str(request.args.get('kind') or '').strip()
+    query = {'storyId': sid}
+    if kind:
+        query['kind'] = kind
+    total = db.count('interlude_script_entry', query)
+    rows = db.get('interlude_script_entry', query, {'sort': {'id': 'desc'}, 'limit': limit, 'offset': offset})
+    return jsonify({'success': True, 'total': total, 'offset': offset, 'limit': limit,
+                    'script': _hdsi_jsonable(rows)})
 
 
-@app.route('/api/theater/<name>', methods=['DELETE'])
+@app.route('/api/hdsi/story/<sid>/memories', methods=['GET', 'POST'])
 @login_required
-def api_delete_theater(name):
-    if '/' in name or '..' in name:
-        return jsonify({'success': False, 'message': '非法名称'}), 400
-    p = _theater_path(name)
-    if not os.path.exists(p):
-        return jsonify({'success': False, 'message': f'剧场 {name} 不存在'}), 404
-    try:
-        os.remove(p)
-        # 若正在编辑该剧场则同时关闭前端弹窗（前端处理）
-        return jsonify({'success': True, 'message': f'剧场《{name}》已删除'})
-    except Exception as e:
-        app.logger.error(f"删除剧场 {name} 失败: {e}")
-        return jsonify({'success': False, 'message': f'删除失败: {str(e)}'}), 500
+def api_hdsi_story_memories(sid):
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    now = _hdsi_now()
+    if request.method == 'GET':
+        rows = db.get('interlude_memory', {'storyId': sid},
+                      {'sort': {'importance': 'desc', 'updatedAt': 'desc'}, 'limit': 500})
+        return jsonify({'success': True, 'memories': _hdsi_jsonable(rows)})
+    payload = request.get_json(silent=True) or {}
+    added = 0
+    for item in (payload.get('add') or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get('content') or '').strip()
+        if not content:
+            continue
+        category = str(item.get('category') or 'event').strip()[:32] or 'event'
+        try:
+            importance = max(0.0, min(1.0, float(item.get('importance') or 0.5)))
+        except Exception:  # noqa: BLE001
+            importance = 0.5
+        try:
+            source_entry_id = int(item.get('sourceEntryId')) if item.get('sourceEntryId') else None
+        except Exception:  # noqa: BLE001
+            source_entry_id = None
+        db.create('interlude_memory', {
+            'storyId': sid, 'participantId': str(item.get('participantId') or '')[:255],
+            'category': category, 'content': content[:4000], 'importance': importance,
+            'status': 'active', 'sourceEntryId': source_entry_id,
+            'createdAt': now, 'updatedAt': now,
+        })
+        added += 1
+    removed = 0
+    for item in (payload.get('deletes') or []):
+        try:
+            db.remove('interlude_memory', {'storyId': sid, 'id': int(item)})
+            removed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    for item in (payload.get('supersede') or []):
+        try:
+            db.set('interlude_memory', {'storyId': sid, 'id': int(item)},
+                   {'status': 'superseded', 'updatedAt': now})
+        except Exception:  # noqa: BLE001
+            continue
+    if payload.get('clearArchived'):
+        db.remove('interlude_memory', {'storyId': sid, 'status': 'superseded'})
+    return jsonify({'success': True, 'added': added, 'removed': removed})
+
+
+@app.route('/api/hdsi/story/<sid>/facts', methods=['GET', 'POST'])
+@login_required
+def api_hdsi_story_facts(sid):
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    now = _hdsi_now()
+    if request.method == 'GET':
+        rows = db.get('interlude_fact', {'storyId': sid},
+                      {'sort': {'importance': 'desc', 'updatedAt': 'desc'}, 'limit': 500})
+        return jsonify({'success': True, 'facts': _hdsi_jsonable(rows)})
+    payload = request.get_json(silent=True) or {}
+    added = 0
+    for item in (payload.get('add') or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get('content') or '').strip()
+        scope = str(item.get('scope') or 'event').strip()
+        if not content or scope not in _HDSI_FACT_SCOPES:
+            continue
+        try:
+            importance = max(0.0, min(1.0, float(item.get('importance') or 0.5)))
+            confidence = max(0.0, min(1.0, float(item.get('confidence') or 0.8)))
+        except Exception:  # noqa: BLE001
+            importance, confidence = 0.5, 0.8
+        db.create('interlude_fact', {
+            'storyId': sid, 'participantId': str(item.get('participantId') or '')[:255],
+            'scope': scope, 'content': content[:4000], 'importance': importance,
+            'confidence': confidence, 'unresolved': bool(item.get('unresolved')),
+            'status': 'active', 'sourceEntryIds': item.get('sourceEntryIds') or [],
+            'lastSeenAt': now, 'createdAt': now, 'updatedAt': now,
+        })
+        added += 1
+    for item in (payload.get('forget') or []):
+        try:
+            db.set('interlude_fact', {'storyId': sid, 'id': int(item)},
+                   {'status': 'superseded', 'updatedAt': now})
+        except Exception:  # noqa: BLE001
+            continue
+    for item in (payload.get('restore') or []):
+        try:
+            db.set('interlude_fact', {'storyId': sid, 'id': int(item)},
+                   {'status': 'active', 'updatedAt': now})
+        except Exception:  # noqa: BLE001
+            continue
+    for item in (payload.get('deletes') or []):
+        try:
+            db.remove('interlude_fact', {'storyId': sid, 'id': int(item)})
+        except Exception:  # noqa: BLE001
+            continue
+    return jsonify({'success': True, 'added': added})
+
+
+@app.route('/api/hdsi/story/<sid>/intents', methods=['GET', 'POST'])
+@login_required
+def api_hdsi_story_intents(sid):
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    now = _hdsi_now()
+    if request.method == 'GET':
+        rows = db.get('interlude_intent', {'storyId': sid},
+                      {'sort': {'notBefore': 'asc', 'id': 'desc'}, 'limit': 300})
+        return jsonify({'success': True, 'intents': _hdsi_jsonable(rows)})
+    payload = request.get_json(silent=True) or {}
+    added = 0
+    for item in (payload.get('add') or [])[:20]:
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get('summary') or '').strip()
+        intent_type = str(item.get('type') or 'delayed-reply').strip()
+        if not summary or intent_type not in _HDSI_INTENT_TYPES:
+            continue
+        try:
+            minutes = max(1, min(43200, int(float(item.get('minutes') or 30))))
+        except Exception:  # noqa: BLE001
+            minutes = 30
+        not_before = now + __import__('datetime').timedelta(minutes=minutes)
+        db.create('interlude_intent', {
+            'storyId': sid, 'participantId': str(item.get('participantId') or '')[:255],
+            'type': intent_type, 'summary': summary[:4000], 'notBefore': not_before,
+            'status': 'pending', 'payload': item.get('payload') or {},
+            'createdAt': now, 'updatedAt': now,
+        })
+        added += 1
+    for item in (payload.get('cancel') or []):
+        try:
+            db.set('interlude_intent', {'storyId': sid, 'id': int(item)},
+                   {'status': 'cancelled', 'updatedAt': now})
+        except Exception:  # noqa: BLE001
+            continue
+    for item in (payload.get('complete') or []):
+        try:
+            db.set('interlude_intent', {'storyId': sid, 'id': int(item)},
+                   {'status': 'completed', 'updatedAt': now})
+        except Exception:  # noqa: BLE001
+            continue
+    for item in (payload.get('deletes') or []):
+        try:
+            db.remove('interlude_intent', {'storyId': sid, 'id': int(item)})
+        except Exception:  # noqa: BLE001
+            continue
+    if payload.get('clearDone'):
+        db.remove('interlude_intent', {'storyId': sid, 'status': 'cancelled'})
+        db.remove('interlude_intent', {'storyId': sid, 'status': 'completed'})
+    return jsonify({'success': True, 'added': added})
+
+
+@app.route('/api/hdsi/participant/<pid>', methods=['POST'])
+@login_required
+def api_hdsi_participant_update(pid):
+    if '/' in pid or '..' in pid:
+        return jsonify({'success': False, 'message': '非法参与者 ID'}), 400
+    db = _get_hdsi_db()
+    rows = db.get('interlude_participant', {'id': pid})
+    if not rows:
+        return jsonify({'success': False, 'message': '参与者不存在'}), 404
+    payload = request.get_json(silent=True) or {}
+    now = _hdsi_now()
+    patch = {'updatedAt': now}
+    for field in ('displayName', 'profile', 'relationship'):
+        if field in payload:
+            patch[field] = str(payload.get(field) or '')[:4000]
+    status = str(payload.get('status') or '')
+    if status in ('active', 'paused'):
+        patch['status'] = status
+    if isinstance(payload.get('state'), dict):
+        state = dict(rows[0].get('state') or {})
+        incoming = payload['state']
+
+        def _lines(value, limit, item_limit):
+            if isinstance(value, list):
+                items = value
+            else:
+                items = [line.strip() for line in str(value or '').splitlines() if line.strip()]
+            return [str(item).strip()[:item_limit] for item in items if str(item).strip()][:limit]
+
+        if 'openThreads' in incoming:
+            state['openThreads'] = _lines(incoming['openThreads'], 50, 500)
+        if 'relationshipNotes' in incoming:
+            state['relationshipNotes'] = _lines(incoming['relationshipNotes'], 50, 500)
+        if 'relationshipOverlay' in incoming:
+            overlay_text = str(incoming['relationshipOverlay'] or '').strip()
+            if overlay_text:
+                state['relationshipOverlay'] = overlay_text[:4000]
+            else:
+                state.pop('relationshipOverlay', None)
+        for counter in ('unreadMessageCount', 'pendingReplyCount'):
+            if counter in incoming:
+                try:
+                    state[counter] = max(0, int(float(incoming[counter])))
+                except Exception:  # noqa: BLE001
+                    pass
+        patch['state'] = state
+    db.set('interlude_participant', {'id': pid}, patch)
+    return jsonify({'success': True, 'message': '参与者已保存'})
+
+
+@app.route('/api/hdsi/story/<sid>/patches/<int:patch_id>', methods=['POST'])
+@login_required
+def api_hdsi_patch_action(sid, patch_id):
+    db = _get_hdsi_db()
+    if not _hdsi_story_row(sid):
+        return jsonify({'success': False, 'message': '剧场不存在'}), 404
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get('action') or '')
+    if action not in ('reject', 'clear'):
+        return jsonify({'success': False, 'message': '只支持 reject / clear'}), 400
+    rows = db.get('interlude_state_patch', {'storyId': sid, 'id': patch_id})
+    if not rows:
+        return jsonify({'success': False, 'message': '设定补丁不存在'}), 404
+    status = 'rejected' if action == 'reject' else 'cleared'
+    db.set('interlude_state_patch', {'storyId': sid, 'id': patch_id}, {'status': status})
+    return jsonify({'success': True, 'message': '已%s设定补丁' % ('驳回' if action == 'reject' else '清除')})
 
 
 def run_bat_file():

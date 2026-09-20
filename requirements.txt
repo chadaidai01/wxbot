@@ -13,3 +13,5 @@ filelock
 requests
 beautifulsoup4
 lxml
+tzdata
+

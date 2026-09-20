@@ -227,7 +227,25 @@ LOCALDB_POLL_INTERVAL = 2.0
 # 只处理最近多少秒内的新消息（防止启动时回灌历史记录）
 LOCALDB_ONLY_RECENT_SECONDS = 15.0
 
-# ===== 剧场系统（参考 HDS-Interlude 的叙事驱动思路）=====
+# ===== 剧场系统（HDS-Interlude 1.0.1-beta6-rebuild Python 移植版 hdsi/）=====
+# 整个剧场引擎已逐模块移植到 hdsi/ 包（上游 https://gitee.com/MomoiCore/hds-interlude）。
+# 下列开关会映射到上游配置段（括号内为上游字段），不再由旧的 theater.py 实现：
+#   THEATER_ADVANCE_INTERVAL_MINUTES → runtime.autoAdvanceIntervalMinutes
+#   THEATER_PROACTIVE_THRESHOLD     → runtime.proactiveWillingnessThreshold（按 0-100 换算成 0-1）
+#   THEATER_RESPECT_QUIET_TIME      → runtime.restWindows（22:00-08:00）
+#   THEATER_SCRIPT_BUDGET           → runtime.contextEntryLimit
+#   THEATER_RECENT_CONTEXT          → memory.recentEntryLimit
+#   THEATER_ALTER_*                 → alterSystem.*
+#   THEATER_TIME_DIRECTOR_ENABLED   → timelineDirector.enabled
+#   THEATER_FOLLOWUP_MINUTES_1/2    → runtime.conversationFollowUpMinutes
+#   THEATER_PREPLAN_*               → schedulePreplan.*
+#   THEATER_PROACTIVE_ENABLED       → agency.enabled + runtime.allowProactiveMessages
+#   THEATER_MIN_PROACTIVE_INTERVAL_MINUTES → agency.minimumProactiveIntervalMinutes
+#   THEATER_COMPACT_ENABLED         → memory.enabled
+#   THEATER_ACTIVE_CONSEQUENCE_DECAY→ memory.activeConsequenceDefaultStrength
+#   THEATER_GROUP_WILLINGNESS_*     → onebot.groupChats[].willingness
+# 下列旧开关在移植版中已无对应物（上游固定行为），仅保留以兼容旧配置：
+#   THEATER_GROUP_REPLY_PROBABILITY / THEATER_BUBBLE_INTERVAL_HOURS / THEATER_CONTINUITY_REFRESH_TURNS
 # 让 AI 从"对话者"变成"演员"：每个角色维护一部持续上演的生活剧本（剧场），
 # 每次对话补写幕间经历、决定回复/沉默/延迟，并自动推进剧情、主动联系。
 ENABLE_THEATER = True
@@ -249,16 +267,16 @@ THEATER_ALTER_ENABLED = True
 THEATER_ALTER_BASE_THRESHOLD = 10
 # 主动联系最小间隔（分钟）：同一个人短时间内不被反复主动联系
 THEATER_MIN_PROACTIVE_INTERVAL_MINUTES = 30
-# 连续多少次对话/推进后刷新一次"当前状态摘要"（低频 continuity）
+# [旧版遗留，移植版已忽略] 上游固定为"首次自动推进 + 每 15 次成功叙事更新"刷新 continuity
 THEATER_CONTINUITY_REFRESH_TURNS = 5
-# 剧情余波（active consequence）每回合自然衰减量（0~1）
+# 剧情余波默认影响强度（0~1）→ 上游 memory.activeConsequenceDefaultStrength
 THEATER_ACTIVE_CONSEQUENCE_DECAY = 0.1
-# 剧场模式的群聊回复概率（%）：即使模型决定回复，也按此概率实际发送，用于群聊降噪
+# [旧版遗留，移植版已忽略] 剧场模式的群聊回复概率（%）：上游由群聊冷却与意愿层控制，不再按概率丢弃回复
 THEATER_GROUP_REPLY_PROBABILITY = 1
 # 剧场叙事使用的模型。剧场写作是纯文本/JSON，用视觉模型(如 deepseek-v4-flash-vision-exp)会偶发
 # 返回空内容/输出"ext"被过滤。填 'deepseek-chat' 这类稳定的文本模型可彻底避免；留空则用主模型 MODEL。
 THEATER_MODEL = 'deepseek-chat'
-# 剧场"主动冒泡"：去掉随时主动联系，改为每隔多少小时在群里随口冒个泡（0=关闭）
+# [旧版遗留，移植版已忽略] 剧场"主动冒泡"间隔小时数：上游由 sweep/autonomy 调度与 Agency 决定
 THEATER_BUBBLE_INTERVAL_HOURS = 9
 # 剧场群聊被@时，回看最近多少条群聊记录（含图片识图）作为上下文
 THEATER_RECENT_LOOKBACK = 15

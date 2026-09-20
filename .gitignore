@@ -37,3 +37,7 @@ libs/wxautox4_wechatbot-*.whl
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---------- 6. 上游对照源码（只读参考，不提交）----------
+.hdsi_reference/
+

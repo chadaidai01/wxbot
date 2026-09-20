@@ -1254,12 +1254,12 @@
             startChatContextUserPolling();
             setupGroupChatOptionsVisibility();
             startCoreMemoryFilePolling();
-            // 剧场记忆列表：页面加载即加载，刷新后也一直有内容
-            loadTheaterList();
+            // 剧场记忆列表：页面加载即加载（同时触发旧 JSON 归档），刷新后也一直有内容
+            hdsiLoadStories();
             // 点击遮罩关闭剧场记忆弹窗（兜底）
             (function () {
                 const m = document.getElementById('editTheaterMemoryModal');
-                if (m) m.addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none'; });
+                if (m) m.addEventListener('click', function (e) { if (e.target === this) hdsiCloseStory(); });
             })();
                         
             // 初始化NPC设置区域
@@ -1877,710 +1877,960 @@
             }
             window.removeEntry = removeEntry;
 
-            // ===== 剧场记忆管理（分层 Tabbed 编辑器，参考 HDS-Interlude 记忆分层）=====
-            let currentTheaterName = null;
-            let tmCurrentState = null;        // 缓存最近一次加载的剧场 JSON
-            let tmScriptOffset = 0;           // 时间线分页游标
-            const TM_SCRIPT_PAGE = 60;
-            let tmTabsBound = false;          // 是否已绑定 tab 切换事件
+            // ===== 剧场记忆管理（HDS-Interlude 引擎，数据源 Theater/hdsi.sqlite3）=====
+            let hdsiStories = [];
+            let hdsiBundle = null;
+            let hdsiStoryId = null;
+            let hdsiScriptOffset = 0;
+            let hdsiActiveTab = 'canon';
+            const HDSI_SCRIPT_PAGE = 40;
 
-            function _tmEsc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-            function _tmSplitLines(text) { return String(text||'').split(/\r?\n/).map(s=>s.trim()).filter(s=>s); }
-            function _tmFmtTs(ts) {
-                if (!ts) return '—';
-                const d = new Date(ts * 1000);
-                if (isNaN(d.getTime())) return String(ts);
-                const p = n => String(n).padStart(2,'0');
-                return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+            function _hdsiEsc(value) {
+                return String(value == null ? '' : value)
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
             }
-            function _tmRelLeft(targetTs, now) {
-                if (!targetTs) return '—';
-                const s = targetTs - (now || Date.now()/1000);
-                if (s <= 0) return '已到期';
-                const m = Math.round(s/60);
-                if (m < 60) return m + ' 分钟后';
-                const h = Math.floor(m/60);
-                if (h < 24) return h + ' 小时 ' + (m%60) + ' 分后';
-                return Math.floor(h/24) + ' 天后';
+            function _hdsiFmt(value) {
+                if (!value) return '—';
+                const d = new Date(value);
+                if (isNaN(d.getTime())) return String(value);
+                const p = n => String(n).padStart(2, '0');
+                return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
             }
-
-            async function loadTheaterList() {
-                const list = document.querySelector('#section-theater-memory .theater-file-list');
-                const noData = document.querySelector('#section-theater-memory .no-theater-data');
-                if (!list || !noData) return;
-                try {
-                    const r = await fetch('/api/theaters');
-                    const d = await r.json();
-                    if (!d.success) { noData.style.display = 'block'; noData.textContent = d.message || '加载失败'; list.style.display = 'none'; return; }
-                    const theaters = d.theaters || [];
-                    list.innerHTML = '';
-                    if (!theaters.length) { noData.style.display = 'block'; list.style.display = 'none'; return; }
-                    noData.style.display = 'none';
-                    list.style.display = 'block';
-                    for (const t of theaters) {
-                        const li = document.createElement('li');
-                        li.className = 'theater-file-item';
-                        li.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 12px; border-bottom:1px solid #eee;';
-                        const info = document.createElement('span');
-                        info.style.cssText = 'flex:1;';
-                        let counts = [];
-                        if ((t.participants||[]).length) counts.push('参与者 ' + t.participants.length);
-                        if (t.script_entries) counts.push('剧本 ' + t.script_entries + ' 条');
-                        if (t.threads) counts.push('引子 ' + t.threads);
-                        if (t.long_term) counts.push('长期 ' + t.long_term);
-                        if (t.overlays) counts.push('Overlay ' + t.overlays);
-                        if (t.intents) counts.push('待办 ' + t.intents);
-                        info.textContent = t.name + (counts.length ? '（' + counts.join('、') + '）' : '') + (t.scene ? ' — ' + t.scene : '');
-                        const btn = document.createElement('button');
-                        btn.type = 'button';
-                        btn.className = 'edit-memory-btn';
-                        btn.textContent = '编辑';
-                        btn.onclick = () => editTheaterMemory(t.name);
-                        const delBtn = document.createElement('button');
-                        delBtn.type = 'button';
-                        delBtn.className = 'edit-memory-btn';
-                        delBtn.style.cssText = 'background:#f44336; color:#fff; border:none; border-radius:4px; padding:4px 12px; cursor:pointer;';
-                        delBtn.textContent = '删除';
-                        delBtn.onclick = () => deleteTheater(t.name);
-                        const btnGroup = document.createElement('div');
-                        btnGroup.style.cssText = 'display:flex; gap:8px; flex-shrink:0;';
-                        btnGroup.appendChild(btn);
-                        btnGroup.appendChild(delBtn);
-                        li.appendChild(info);
-                        li.appendChild(btnGroup);
-                        list.appendChild(li);
-                    }
-                } catch (e) { noData.style.display = 'block'; noData.textContent = '加载失败: ' + e; list.style.display = 'none'; }
+            function _hdsiLines(text) {
+                return String(text || '').split(/\r?\n/).map(s => s.trim()).filter(s => s);
             }
-            function showTheaterError(msg) {
-                const el = document.getElementById('editTheaterMemoryError');
+            function _hdsiVal(id) {
+                const el = document.getElementById(id);
+                return el ? el.value : '';
+            }
+            function _hdsiFill(id, value) {
+                const el = document.getElementById(id);
+                if (el) el.value = (value == null ? '' : value);
+            }
+            function hdsiStatus(message, isError) {
+                const el = document.getElementById('hdsiStatus');
                 if (!el) return;
-                el.textContent = msg;
-                el.style.display = 'block';
+                el.textContent = message || '';
+                el.style.color = isError ? '#f44336' : '#2e7d32';
+                if (!isError && message) {
+                    const saved = document.getElementById('hdsiAutoSaved');
+                    if (saved) saved.textContent = '最近操作：' + message + '（' + new Date().toLocaleTimeString() + '）';
+                }
             }
-            function newTheater() {
-                const name = prompt('请输入要新建的剧场名称（用户昵称或群名，将作为剧本文件名）：');
-                if (!name || !name.trim()) return;
-                editTheaterMemory(name.trim(), true);
+            function hdsiShowError(message) {
+                const el = document.getElementById('hdsiError');
+                if (!el) return;
+                el.textContent = message || '';
+                el.style.display = message ? 'block' : 'none';
             }
+            async function hdsiApi(path, options) {
+                const response = await fetch(path, options);
+                let data = null;
+                try { data = await response.json(); } catch (e) { data = { success: false, message: 'HTTP ' + response.status }; }
+                if (!response.ok || data.success === false) throw new Error(data.message || ('HTTP ' + response.status));
+                return data;
+            }
+            function hdsiSetting() { return (hdsiBundle && hdsiBundle.story && hdsiBundle.story.setting) || {}; }
+            function hdsiState() { return (hdsiBundle && hdsiBundle.story && hdsiBundle.story.state) || {}; }
+            function hdsiParticipants() { return (hdsiBundle && hdsiBundle.participants) || []; }
 
-            function tmSwitchTab(tab) {
-                document.querySelectorAll('#tmTabs .tm-tab-btn').forEach(b => {
-                    b.classList.toggle('active', b.dataset.tab === tab);
-                });
-                document.querySelectorAll('.tm-panel').forEach(p => {
-                    p.style.display = (p.id === 'tm-panel-' + tab) ? 'block' : 'none';
-                });
-                if (tab === 'timeline') tmLoadTimeline(false);
-                if (tab === 'intents' && tmCurrentState) tmRenderIntents(tmCurrentState.intents || []);
-                if (tab === 'summary' && tmCurrentState) tmRenderSummary(tmCurrentState.story_summary || []);
-                if (tab === 'preplan' && tmCurrentState) tmRenderPreplan(tmCurrentState.preplan || {});
-                if (tab === 'runtime' && tmCurrentState) tmRenderRuntime(tmCurrentState);
+            async function hdsiLoadStories() {
+                hdsiShowError('');
+                try {
+                    const data = await hdsiApi('/api/hdsi/stories');
+                    hdsiStories = data.stories || [];
+                    hdsiRenderStoryList();
+                } catch (e) {
+                    hdsiShowError('加载剧场列表失败：' + e.message);
+                }
             }
-            function tmBindTabs() {
-                if (tmTabsBound) return;
-                const tabs = document.getElementById('tmTabs');
-                if (!tabs) return;
-                tabs.addEventListener('click', e => {
-                    const btn = e.target.closest('.tm-tab-btn');
-                    if (btn && btn.dataset.tab) tmSwitchTab(btn.dataset.tab);
+            function hdsiRenderStoryList() {
+                const list = document.getElementById('hdsiStoryList');
+                const noData = document.getElementById('hdsiNoStories');
+                if (!list) return;
+                const filter = (_hdsiVal('hdsiStorySearch') || '').trim().toLowerCase();
+                const items = hdsiStories.filter(s => {
+                    if (!filter) return true;
+                    const blob = [s.characterName, s.id, (s.participants || []).join(',')].join(' ').toLowerCase();
+                    return blob.indexOf(filter) >= 0;
                 });
-                tmTabsBound = true;
+                list.innerHTML = '';
+                if (noData) noData.style.display = items.length ? 'none' : 'block';
+                items.forEach(story => {
+                    const counts = story.counts || {};
+                    const li = document.createElement('li');
+                    li.className = 'theater-file-item';
+                    li.style.cssText = 'border:1px solid #e0e6e1;border-radius:10px;padding:10px 12px;margin-bottom:8px;background:#fafdfa;';
+                    li.innerHTML = `
+                        <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;">
+                            <div style="min-width:260px;">
+                                <b>${_hdsiEsc(story.characterName)}</b>
+                                <span style="color:#888;font-size:12px;"> ${_hdsiEsc(story.status || '')} · ${_hdsiEsc(story.platform || '')}</span>
+                                <div style="color:#999;font-size:12px;">${_hdsiEsc(story.id)}</div>
+                                <div style="color:#666;font-size:12px;margin-top:4px;">
+                                    参与者 ${story.participantCount || 0} · 剧本 ${counts.entries || 0} · 记忆 ${counts.memories || 0}
+                                    · 事实 ${counts.facts || 0} · 意图 ${counts.intents || 0} · 场景 ${counts.scenes || 0}
+                                </div>
+                                <div style="color:#999;font-size:12px;margin-top:2px;">
+                                    更新：${_hdsiFmt(story.updatedAt)}${story.scene ? ' · 当前场景：' + _hdsiEsc(String(story.scene).slice(0, 60)) : ''}
+                                </div>
+                            </div>
+                            <div style="display:flex;gap:8px;">
+                                <button type="button" class="tm-mini-btn">编辑</button>
+                            </div>
+                        </div>`;
+                    li.querySelector('button').addEventListener('click', () => hdsiOpenStory(story.id));
+                    list.appendChild(li);
+                });
             }
-
-            async function editTheaterMemory(name, isNew) {
-                currentTheaterName = name;
-                tmBindTabs();
-                document.getElementById('editTheaterMemoryName').textContent = name;
-                document.getElementById('editTheaterMemoryError').style.display = 'none';
-                document.getElementById('tmAutoSaved').textContent = '';
-                document.getElementById('editTheaterMemoryModal').style.display = 'block';
-                tmScriptOffset = 0;
-                tmCurrentState = null;
-                if (isNew) {
-                    // 新建：所有可编辑字段置空，只读列表显示空状态
-                    const emptyIds = ['tmCharacter','tmWorld','tmScene','tmBrief','tmPerspective',
-                                      'tmThreads','tmLongTerm','tmOverlays','tmParticipants',
-                                      'tmContinuityCurrent','tmContinuityNext','tmContinuityRecent','tmContinuitySalient',
-                                      'tmConsequences','tmMoodDescription','tmAgencyBasis','tmPresence'];
-                    for (const id of emptyIds) { const el = document.getElementById(id); if (el) el.value = ''; }
-                    ['tmMoodCumulative','tmMoodWeight'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '0'; });
-                    ['tmMoodDirection'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-                    ['tmAgencyLoad','tmAgencyPrivacy','tmAgencyDevice'].forEach(id => {
-                        const el = document.getElementById(id); if (el) el.selectedIndex = 0;
+            async function hdsiNewStory() {
+                const name = prompt('手动新建剧场（高级）\n\n机器人自动创建的是「聊天名 + 角色哈希」主剧本；手动新建主要用于测试/演练编辑器。\n可填写角色名：', '');
+                if (name === null) return;
+                try {
+                    const data = await hdsiApi('/api/hdsi/stories', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: name })
                     });
-                    const el = document.getElementById('tmAgencyMinutes'); if (el) el.value = '120';
-                    document.getElementById('tmStat').textContent = '新建剧场';
-                    document.getElementById('tmTimelineCount').textContent = '剧本条目：0';
-                    document.getElementById('tmTimelineList').innerHTML = '（暂无剧本）';
-                    document.getElementById('tmIntentsCount').textContent = '待办意图：0';
-                    document.getElementById('tmIntentsList').innerHTML = '（暂无意图）';
-                    document.getElementById('tmSummaryCount').textContent = '前情摘要：0 条';
-                    document.getElementById('tmSummaryList').innerHTML = '（暂无摘要）';
-                    document.getElementById('tmPendingPromises').innerHTML = '（无）';
-                    document.getElementById('tmPreplanInfo').textContent = '日程审查信息：未审查';
-                    document.getElementById('tmRegimesList').innerHTML = '';
-                    document.getElementById('tmExceptionsList').innerHTML = '';
-                    document.getElementById('tmRuntimeInfo').innerHTML = '（新建剧场，尚无运行数据）';
-                    tmSwitchTab('canon');
+                    await hdsiLoadStories();
+                    hdsiStatus('已创建 ' + data.id);
+                    hdsiOpenStory(data.id);
+                } catch (e) {
+                    hdsiShowError('新建失败：' + e.message);
+                }
+            }
+            async function hdsiOpenStory(id) {
+                hdsiStoryId = id;
+                hdsiShowError('');
+                hdsiScriptOffset = 0;
+                try {
+                    hdsiBundle = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(id));
+                } catch (e) {
+                    hdsiShowError('打开剧场失败：' + e.message);
                     return;
                 }
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(name));
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '加载失败'); return; }
-                    tmPopulateAll(d.theater || {});
-                    tmSwitchTab('canon');
-                } catch (e) { showTheaterError('加载失败: ' + e); }
+                const modal = document.getElementById('editTheaterMemoryModal');
+                if (modal) modal.style.display = 'block';
+                _hdsiFill('hdsiTitleName', (hdsiSetting().character || {}).name || id);
+                hdsiRenderAll();
             }
-
-            function tmPopulateAll(t) {
-                tmCurrentState = t;
-                const canon = t.canon || {};
-                // 标签 1：Canon
-                document.getElementById('tmCharacter').value = canon.character || '';
-                document.getElementById('tmWorld').value = canon.world || '';
-                document.getElementById('tmScene').value = canon.scene || '';
-                document.getElementById('tmBrief').value = canon.script_brief || '';
-                document.getElementById('tmPerspective').value = t.perspective || '';
-                // 标签 3：Memory
-                document.getElementById('tmThreads').value = (t.threads || []).join('\n');
-                document.getElementById('tmLongTerm').value = (t.long_term || []).join('\n');
-                const pending = (t.intents || []).filter(i => !i.done && (i.type === 'promise' || i.type === 'delayed_reply'));
-                document.getElementById('tmPendingPromises').innerHTML = pending.length
-                    ? pending.map(i => `<div>• [${_tmEsc(i.type)}] → ${_tmEsc(i.target_user||'自己')}：${_tmEsc((i.content||'').slice(0,80))} <span style="color:#888;">（${_tmRelLeft(i.target_ts)}）</span></div>`).join('')
-                    : '（无）';
-                // 标签 4：Overlay
-                document.getElementById('tmOverlays').value = (t.overlays || []).map(o => [o.layer, o.target, o.description].filter(x=>x).join('|')).join('\n');
-                // 标签 5：Participants
-                document.getElementById('tmParticipants').value = Object.entries(t.participants || {}).map(([n,p]) => [n, p.profile, p.relation, p.relation_evolution, p.arc].filter(x=>x).join('|')).join('\n');
-                // 标签 6：Status
-                const cont = t.continuity || {};
-                document.getElementById('tmContinuityCurrent').value = cont.current || '';
-                document.getElementById('tmContinuityNext').value = Array.isArray(cont.next) ? cont.next.join('\n') : '';
-                document.getElementById('tmContinuityRecent').value = Array.isArray(cont.recent) ? cont.recent.join('\n') : '';
-                document.getElementById('tmContinuitySalient').value = Array.isArray(cont.salient) ? cont.salient.join('\n') : '';
-                const now = Date.now()/1000;
-                document.getElementById('tmConsequences').value = (t.consequences || []).map(c => {
-                    const mins = c.expires_ts ? Math.max(0, Math.round((c.expires_ts - now)/60)) : 0;
-                    return [c.effect, c.strength, mins].filter(x=>x!==null && x!=='').join('|');
-                }).join('\n');
-                const m = t.mood || {};
-                document.getElementById('tmMoodCumulative').value = m.cumulative || 0;
-                document.getElementById('tmMoodWeight').value = (m.weight || 0);
-                document.getElementById('tmMoodDirection').value = (m.direction == null ? '' : String(m.direction));
-                document.getElementById('tmMoodDescription').value = m.description || '';
-                const a = t.agency || {};
-                document.getElementById('tmAgencyLoad').value = a.activityLoad || 'free';
-                document.getElementById('tmAgencyPrivacy').value = a.privacy || 'private';
-                document.getElementById('tmAgencyDevice').value = a.deviceAccess || 'available';
-                const validLeft = a.valid_until ? Math.max(0, Math.round((a.valid_until - now)/60)) : 0;
-                document.getElementById('tmAgencyMinutes').value = validLeft || 120;
-                document.getElementById('tmAgencyBasis').value = a.basis || '';
-                // 标签 9：在场表
-                document.getElementById('tmPresence').value = (t.presence || []).map(p => [p.name, p.status, p.note].filter(x=>x).join('|')).join('\n');
-                // 标签 8：前情摘要（可编辑区回填，最旧在前=存储顺序）
-                document.getElementById('tmSummaryText').value = (t.story_summary || []).map(s => String(s.text || '')).join('\n');
-                // 状态栏
-                document.getElementById('tmStat').textContent =
-                    `剧本 ${len(t.script)} 条 · 参与者 ${len(t.participants)} · 引子 ${len(t.threads)} · 长期 ${len(t.long_term)} · Overlay ${len(t.overlays)} · 待办 ${countNotDone(t.intents)}`;
-                function len(x) { try { return (x||[]).length; } catch(_) { return 0; } }
-                function countNotDone(arr) { return (arr||[]).filter(i=>!i.done).length; }
+            function hdsiCloseStory() {
+                const modal = document.getElementById('editTheaterMemoryModal');
+                if (modal) modal.style.display = 'none';
+                hdsiBundle = null;
+                hdsiStoryId = null;
             }
-
-            // ---------- 时间线（只读，分页） ----------
-            async function tmLoadTimeline(force) {
-                if (!currentTheaterName) return;
-                if (force) tmScriptOffset = 0;
+            function hdsiSwitchTab(tab) {
+                hdsiActiveTab = tab;
+                document.querySelectorAll('#hdsiTabs .tm-tab-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.tab === tab);
+                });
+                document.querySelectorAll('#editTheaterMemoryModal .tm-panel').forEach(panel => {
+                    panel.style.display = (panel.id === 'tm-panel-' + tab) ? 'block' : 'none';
+                });
+                if (tab === 'script') hdsiLoadScript(true);
+                if (tab === 'memories') hdsiLoadMemories();
+                if (tab === 'facts') hdsiLoadFacts();
+                if (tab === 'intents') hdsiLoadIntents();
+            }
+            function hdsiRenderAll() {
+                if (!hdsiBundle) return;
+                hdsiRenderStat();
+                hdsiRenderCanon();
+                hdsiRenderOverlay();
+                hdsiRenderParticipants();
+                hdsiRenderScenes();
+                hdsiRenderState();
+                hdsiRenderPreplan();
+                hdsiRenderRuntime();
+                hdsiFillParticipantSelects();
+            }
+            function hdsiRenderStat() {
+                const story = hdsiBundle.story || {};
+                const counts = story.counts || {};
+                const el = document.getElementById('hdsiStat');
+                if (el) {
+                    el.textContent = `${story.status || ''} · 剧本 ${counts.entries || 0} · 记忆 ${counts.memories || 0}`
+                        + ` · 事实 ${counts.facts || 0} · 意图 ${counts.intents || 0} · 场景 ${counts.scenes || 0}`
+                        + ` · 补丁 ${counts.patches || 0}`;
+                }
+                _hdsiFill('hdsiTitleName', (hdsiSetting().character || {}).name || story.id || '');
+            }
+            function hdsiRenderCanon() {
+                const setting = hdsiSetting();
+                const character = setting.character || {};
+                const user = setting.user || {};
+                _hdsiFill('hdsiCharName', character.name);
+                _hdsiFill('hdsiCharProfile', character.profile);
+                _hdsiFill('hdsiUserName', user.displayName);
+                _hdsiFill('hdsiUserProfile', user.profile);
+                [['hdsiRelationship', 'relationship'], ['hdsiWorld', 'world'], ['hdsiPerspective', 'perspective'],
+                 ['hdsiSupportingCast', 'supportingCast'], ['hdsiStyle', 'style'], ['hdsiLocation', 'location'],
+                 ['hdsiTimezone', 'timezone']].forEach(([id, key]) => _hdsiFill(id, setting[key]));
+            }
+            async function hdsiApplyUpdate(body, okMessage) {
                 try {
-                    const url = '/api/theater/' + encodeURIComponent(currentTheaterName) + '/script?offset=' + tmScriptOffset + '&limit=' + TM_SCRIPT_PAGE;
-                    const r = await fetch(url);
-                    const d = await r.json();
-                    if (!d.success) { document.getElementById('tmTimelineList').textContent = d.message || '加载失败'; return; }
-                    const items = d.script || [];
-                    const total = d.total || 0;
-                    document.getElementById('tmTimelineCount').textContent = `剧本条目：${total} 条（已加载 ${tmScriptOffset + items.length}）`;
-                    const listEl = document.getElementById('tmTimelineList');
-                    if (!items.length && tmScriptOffset === 0) {
-                        listEl.innerHTML = '（暂无剧本，角色和用户聊过天后会自动创建）';
-                        return;
-                    }
-                    const html = items.map(it => {
-                        const t = it.type || 'advance';
-                        const local = _tmFmtTs(it.time);
-                        const who = _tmEsc(it.who || '');
-                        const content = _tmEsc(it.content || '');
-                        const collapsed = (content.length > 160) ? ' collapsed' : '';
-                        return `<div class="tm-script-entry">
-                            <span class="tm-script-time">${local}</span>
-                            <span class="tm-script-type ${t}">${t}</span>
-                            <span class="tm-script-who">${who}</span>
-                            <span class="tm-script-content${collapsed}" onclick="this.classList.toggle('collapsed')">${content}</span>
-                        </div>`;
-                    }).join('');
-                    if (force || tmScriptOffset === 0) {
-                        listEl.innerHTML = html;
-                    } else {
-                        listEl.innerHTML += html;
-                    }
-                    // 倒序展示（最新在上）：reverse 在 DOM 上不便于增量，这里保持顺序加载；用户可上下滚。
-                    tmScriptOffset += items.length;
+                    hdsiBundle = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
+                    hdsiRenderAll();
+                    hdsiStatus(okMessage || '已保存');
+                    hdsiShowError('');
                 } catch (e) {
-                    document.getElementById('tmTimelineList').textContent = '加载失败: ' + e;
+                    hdsiShowError('保存失败：' + e.message);
                 }
             }
-            async function tmLoadMoreScript() { tmLoadTimeline(false); }
-            async function tmClearScript() {
-                if (!currentTheaterName) return;
-                if (!confirm('确定清空剧本（script）吗？保留 Canon/记忆/Overlay，但所有时间线条目将永久删除。')) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ script_clear: true })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '清空失败'); return; }
-                    tmScriptOffset = 0;
-                    tmLoadTimeline(true);
-                    showTheaterError('✓ 已清空剧本');
-                    setTimeout(() => { document.getElementById('editTheaterMemoryError').style.display = 'none'; }, 2000);
-                } catch (e) { showTheaterError('清空失败: ' + e); }
-            }
-
-            // ---------- Overlay 清层 ----------
-            async function tmClearOverlayLayer(layer) {
-                if (!currentTheaterName || !layer) return;
-                if (!confirm(`确定清除 Overlay 中的「${layer}」层吗？其余层与剧本保留。`)) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ overlay_clear_layer: layer })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '清除失败'); return; }
-                    // 重读覆盖层并刷新输入框
-                    const r2 = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName));
-                    const d2 = await r2.json();
-                    if (d2.success) {
-                        tmCurrentState = d2.theater;
-                        document.getElementById('tmOverlays').value = (d2.theater.overlays || []).map(o => [o.layer, o.target, o.description].filter(x=>x).join('|')).join('\n');
+            function hdsiSaveCanon() {
+                return hdsiApplyUpdate({
+                    setting: {
+                        character: { name: _hdsiVal('hdsiCharName'), profile: _hdsiVal('hdsiCharProfile') },
+                        user: { displayName: _hdsiVal('hdsiUserName'), profile: _hdsiVal('hdsiUserProfile') },
+                        relationship: _hdsiVal('hdsiRelationship'), world: _hdsiVal('hdsiWorld'),
+                        perspective: _hdsiVal('hdsiPerspective'), supportingCast: _hdsiVal('hdsiSupportingCast'),
+                        location: _hdsiVal('hdsiLocation'), style: _hdsiVal('hdsiStyle'), timezone: _hdsiVal('hdsiTimezone')
                     }
-                    showTheaterError(`✓ 已清除 Overlay ${layer} 层`);
-                } catch (e) { showTheaterError('清除失败: ' + e); }
+                }, '设定已保存');
+            }
+            function hdsiRenderOverlay() {
+                const overlay = hdsiState().settingOverlay || {};
+                _hdsiFill('hdsiOverlayCharacter', overlay.characterProfile);
+                _hdsiFill('hdsiOverlayPerspective', overlay.perspective);
+                _hdsiFill('hdsiOverlayRelationship', overlay.relationship);
+                _hdsiFill('hdsiOverlayWorld', overlay.world);
+                _hdsiFill('hdsiOverlayCast', overlay.supportingCast);
+                _hdsiFill('hdsiOverlayLocation', overlay.location);
+                _hdsiFill('hdsiOverlayTraits', (overlay.characterTraits || []).join('\n'));
+                const box = document.getElementById('hdsiOverlaySnapshots');
+                if (box) {
+                    const snapshots = hdsiBundle.snapshots || [];
+                    box.innerHTML = snapshots.length ? snapshots.map(s => `
+                        <div style="border-bottom:1px dashed #ddd;padding:4px 0;">
+                            <b>${_hdsiEsc(s.target)}</b>/<span>${_hdsiEsc(s.tier)}</span>
+                            · ${_hdsiFmt(s.periodStart)} ~ ${_hdsiFmt(s.periodEnd)} · ${_hdsiEsc(s.status)}
+                            <div>${_hdsiEsc(s.summary || '')}</div>
+                        </div>`).join('') : '（无）';
+                }
+            }
+            function hdsiSaveOverlay() {
+                return hdsiApplyUpdate({
+                    settingOverlay: {
+                        characterProfile: _hdsiVal('hdsiOverlayCharacter'),
+                        perspective: _hdsiVal('hdsiOverlayPerspective'),
+                        relationship: _hdsiVal('hdsiOverlayRelationship'),
+                        world: _hdsiVal('hdsiOverlayWorld'),
+                        supportingCast: _hdsiVal('hdsiOverlayCast'),
+                        location: _hdsiVal('hdsiOverlayLocation'),
+                        characterTraits: _hdsiLines(_hdsiVal('hdsiOverlayTraits'))
+                    }
+                }, '演化层已保存');
+            }
+            async function hdsiClearOverlay() {
+                if (!confirm('确定清空整个演化层（settingOverlay）？原始 Canon 不受影响。')) return;
+                await hdsiApplyUpdate({ settingOverlayClear: 'all' }, '演化层已清空');
             }
 
-            // ---------- 意图管理 ----------
-            function tmRenderIntents(intents) {
-                const listEl = document.getElementById('tmIntentsList');
-                const cnt = (intents||[]).filter(i => !i.done).length;
-                document.getElementById('tmIntentsCount').textContent = `待办意图：${cnt}（共 ${intents.length}）`;
-                if (!intents.length) { listEl.innerHTML = '（暂无意图）'; return; }
-                const now = Date.now()/1000;
-                const typeZh = { reminder: '提醒', delayed_reply: '延迟回复', followup: '对话后续', promise: '承诺', proactive: '主动联系', proactive_check: '主动重查' };
-                listEl.innerHTML = intents.map((it, idx) => {
-                    const status = it.done ? '✓已完成' : (it.target_ts <= now ? '⏰已到期' : '⏳待处理');
-                    const color = it.done ? '#888' : (it.target_ts <= now ? '#f44336' : '#388e3c');
-                    const left = _tmRelLeft(it.target_ts, now);
-                    const attempts = it.attempts ? ` · 已尝试 ${it.attempts}` : '';
-                    return `<div class="tm-intent-row">
-                        <span style="color:${color}; font-weight:bold;">[${status}]</span>
-                        <span style="color:#2196F3;">${typeZh[it.type] || it.type}</span>
-                        → <b>${_tmEsc(it.target_user || '自己')}</b>
-                        <span style="color:#888;">（${left}${attempts}）</span>
-                        <div style="margin-top:2px;">${_tmEsc(it.content || '')}${it.motive ? '<br><span style="color:#9c27b0;">动机：' + _tmEsc(it.motive) + '</span>' : ''}</div>
-                        <div style="margin-top:4px;">
-                            ${it.done ? '' : `<button class="tm-mini-btn" onclick="tmMarkIntentDone(${idx})">标记完成</button>`}
-                            <button class="tm-mini-btn tm-danger" onclick="tmDeleteIntent(${idx})">删除</button>
+            // ---------- 剧本 ----------
+            async function hdsiLoadScript(reset) {
+                if (!hdsiStoryId) return;
+                if (reset) { hdsiScriptOffset = 0; }
+                const kind = _hdsiVal('hdsiScriptKind');
+                try {
+                    const data = await hdsiApi(`/api/hdsi/story/${encodeURIComponent(hdsiStoryId)}/script`
+                        + `?offset=${hdsiScriptOffset}&limit=${HDSI_SCRIPT_PAGE}&kind=${encodeURIComponent(kind)}`);
+                    hdsiRenderScriptItems(data.script || [], !reset);
+                    hdsiScriptOffset += (data.script || []).length;
+                    const countEl = document.getElementById('hdsiScriptCount');
+                    if (countEl) countEl.textContent = `剧本条目：${data.total} 条（已显示 ${hdsiScriptOffset}）`;
+                    const more = document.getElementById('hdsiScriptMore');
+                    if (more) more.style.display = (hdsiScriptOffset < data.total) ? 'inline-block' : 'none';
+                } catch (e) {
+                    hdsiShowError('加载剧本失败：' + e.message);
+                }
+            }
+            function hdsiRenderScriptItems(items, append) {
+                const box = document.getElementById('hdsiScriptList');
+                if (!box) return;
+                if (!append) box.innerHTML = '';
+                if (!items.length && !append) { box.textContent = '（无剧本条目）'; return; }
+                items.forEach(entry => {
+                    const meta = entry.metadata || {};
+                    const div = document.createElement('div');
+                    div.className = 'tm-script-item';
+                    const replyMode = meta.interaction && meta.interaction.reply ? meta.interaction.reply.mode : '';
+                    div.innerHTML = `
+                        <div class="tm-script-meta">
+                            #${entry.id} · <b>${_hdsiEsc(entry.kind)}</b> · ${_hdsiEsc(entry.actor || '')}
+                            ${entry.participantId ? ' · ' + _hdsiEsc(entry.participantId) : ''}
+                            · ${_hdsiFmt(entry.occurredAt)}
+                            ${meta.phase ? ' · phase=' + _hdsiEsc(meta.phase) : ''}
+                            ${replyMode ? ' · reply=' + _hdsiEsc(replyMode) : ''}
                         </div>
-                    </div>`;
-                }).join('');
-            }
-            async function tmAddIntent() {
-                if (!currentTheaterName) return;
-                const type = document.getElementById('tmNewIntentType').value;
-                const target = document.getElementById('tmNewIntentTarget').value.trim();
-                const whenMin = parseInt(document.getElementById('tmNewIntentWhen').value, 10) || 30;
-                const content = document.getElementById('tmNewIntentContent').value.trim();
-                if (!content) { showTheaterError('内容不能为空'); return; }
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ intents_add: [{ type, target_user: target, when_min: whenMin, content }] })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '添加失败'); return; }
-                    document.getElementById('tmNewIntentContent').value = '';
-                    if (d.theater && d.theater.intents) tmRenderIntents(d.theater.intents);
-                    else tmRefreshIntentsOnly();
-                    showTheaterError('✓ 已添加意图');
-                } catch (e) { showTheaterError('添加失败: ' + e); }
-            }
-            async function tmDeleteIntent(idx) {
-                if (!currentTheaterName) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ intents_delete: [idx] })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '删除失败'); return; }
-                    if (d.theater && d.theater.intents) tmRenderIntents(d.theater.intents);
-                    else tmRefreshIntentsOnly();
-                } catch (e) { showTheaterError('删除失败: ' + e); }
-            }
-            async function tmMarkIntentDone(idx) {
-                if (!currentTheaterName) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ intents_mark_done: [idx] })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '标记失败'); return; }
-                    if (d.theater && d.theater.intents) tmRenderIntents(d.theater.intents);
-                    else tmRefreshIntentsOnly();
-                } catch (e) { showTheaterError('标记失败: ' + e); }
-            }
-            async function tmRefreshIntentsOnly() {
-                if (!currentTheaterName) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName));
-                    const d = await r.json();
-                    if (d.success) { tmCurrentState = d.theater; tmRenderIntents(d.theater.intents || []); }
-                } catch(_) {}
-            }
-
-            // ---------- 前情摘要 ----------
-            function tmRenderSummary(ss) {
-                const listEl = document.getElementById('tmSummaryList');
-                document.getElementById('tmSummaryCount').textContent = `前情摘要：${ss.length} 条`;
-                if (!ss.length) { listEl.innerHTML = '（暂无摘要，剧本超出预算后会自动压缩成摘要）'; return; }
-                listEl.innerHTML = ss.slice().reverse().map(s => {
-                    return `<div class="tm-summary-row"><span style="color:#888; font-family:monospace;">[${_tmFmtTs(s.ts)}] · 原 ${s.count||0} 条</span><div>${_tmEsc(s.text || '')}</div></div>`;
-                }).join('');
-            }
-            async function tmClearStorySummary() {
-                if (!currentTheaterName) return;
-                if (!confirm('确定清空所有前情摘要吗？')) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ story_summary_clear: true })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '清空失败'); return; }
-                    tmRenderSummary([]);
-                    showTheaterError('✓ 已清空前情摘要');
-                } catch (e) { showTheaterError('清空失败: ' + e); }
-            }
-            async function tmSaveSummary() {
-                if (!currentTheaterName) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ story_summary_text: document.getElementById('tmSummaryText').value })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '保存摘要失败'); return; }
-                    const ss = (d.theater && d.theater.story_summary) || [];
-                    tmRenderSummary(ss);
-                    // 回填规整后的文本（后端按行重建）
-                    document.getElementById('tmSummaryText').value = ss.map(s => String(s.text || '')).join('\n');
-                    showTheaterError('✓ 摘要已保存');
-                } catch (e) { showTheaterError('保存摘要失败: ' + e); }
-            }
-
-            // ---------- 日程 Preplan ----------
-            function tmRenderPreplan(pp) {
-                pp = pp || {};
-                const info = document.getElementById('tmPreplanInfo');
-                info.textContent = `版本 v${pp.version||0} · 上次审查：${pp.reviewed_date || '未审查'} · 下次重试：${_tmFmtTs(pp.next_review_ts)}${pp.note ? ' · ' + pp.note : ''}`;
-                const regimes = pp.regimes || [];
-                const regList = document.getElementById('tmRegimesList');
-                regList.innerHTML = '';
-                regimes.forEach((r, i) => regList.appendChild(tmBuildRegimeCard(r, i)));
-                const excs = pp.exceptions || [];
-                const excList = document.getElementById('tmExceptionsList');
-                excList.innerHTML = '';
-                excs.forEach((e, i) => excList.appendChild(tmBuildExceptionCard(e, i)));
-            }
-            function tmBuildRegimeCard(r, idx) {
-                const card = document.createElement('div');
-                card.className = 'tm-regime-card';
-                const days = (r.days || []).map(d => parseInt(d,10));
-                const dayNames = ['一','二','三','四','五','六','日'];
-                const cbs = dayNames.map((n, i) => {
-                    const dn = i + 1;
-                    const checked = days.includes(dn) ? 'checked' : '';
-                    return `<label class="tm-day-cb"><input type="checkbox" data-rd="${idx}" value="${dn}" ${checked}>周${n}</label>`;
-                }).join('');
-                const blocksText = (r.blocks || []).map(b => [b.start + '-' + b.end, b.type, b.label].filter(x=>x).join('|')).join('\n');
-                card.innerHTML = `
-                    <button class="tm-card-del" onclick="this.parentElement.remove()">删除</button>
-                    <div style="margin-bottom:6px;">${cbs}</div>
-                    <textarea class="tm-blocks-area" placeholder="每行一条：HH:MM-HH:MM|type|label&#10;例：08:00-12:00|fixed|上课">${_tmEsc(blocksText)}</textarea>`;
-                return card;
-            }
-            function tmBuildExceptionCard(e, idx) {
-                const card = document.createElement('div');
-                card.className = 'tm-exception-card';
-                const date = e.date || '';
-                const blocksText = (e.blocks || []).map(b => [b.start + '-' + b.end, b.type, b.label].filter(x=>x).join('|')).join('\n');
-                card.innerHTML = `
-                    <button class="tm-card-del" onclick="this.parentElement.remove()">删除</button>
-                    <div style="margin-bottom:6px;"><label>日期：</label><input type="text" value="${_tmEsc(date)}" placeholder="YYYY-MM-DD" style="width:140px;"></div>
-                    <textarea class="tm-blocks-area" placeholder="每行一条：HH:MM-HH:MM|type|label">${_tmEsc(blocksText)}</textarea>`;
-                return card;
-            }
-            function tmAddRegime() {
-                const list = document.getElementById('tmRegimesList');
-                list.appendChild(tmBuildRegimeCard({days:[], blocks:[]}, list.children.length));
-            }
-            function tmAddException() {
-                const list = document.getElementById('tmExceptionsList');
-                list.appendChild(tmBuildExceptionCard({date:'', blocks:[]}, list.children.length));
-            }
-            function tmCollectPreplan() {
-                const regimes = [];
-                document.querySelectorAll('#tmRegimesList .tm-regime-card').forEach(card => {
-                    const days = Array.from(card.querySelectorAll('input[type=checkbox]:checked')).map(cb => parseInt(cb.value,10)).filter(n => !isNaN(n));
-                    const ta = card.querySelector('textarea');
-                    const blocks = _tmSplitLines(ta ? ta.value : '').map(line => {
-                        const parts = line.split('|').map(s => s.trim());
-                        const range = parts[0] || '';
-                        const m = range.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
-                        if (!m) return null;
-                        return { start: m[1], end: m[2], type: parts[1] || 'routine', label: parts[2] || parts[0] };
-                    }).filter(x => x);
-                    if (days.length && blocks.length) regimes.push({ days, blocks });
+                        <div class="tm-script-content">${_hdsiEsc(entry.content || '')}</div>`;
+                    box.appendChild(div);
                 });
-                const exceptions = [];
-                document.querySelectorAll('#tmExceptionsList .tm-exception-card').forEach(card => {
-                    const date = (card.querySelector('input[type=text]') || {}).value || '';
-                    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
-                    const ta = card.querySelector('textarea');
-                    const blocks = _tmSplitLines(ta ? ta.value : '').map(line => {
-                        const parts = line.split('|').map(s => s.trim());
-                        const range = parts[0] || '';
-                        const m = range.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
-                        if (!m) return null;
-                        return { start: m[1], end: m[2], type: parts[1] || 'routine', label: parts[2] || parts[0] };
-                    }).filter(x => x);
-                    if (blocks.length) exceptions.push({ date, blocks });
+            }
+            async function hdsiClearScript() {
+                if (!confirm('确定清空该剧场的全部剧本条目 / 场景 / 弧线？此操作不可撤销。')) return;
+                if (!confirm('再次确认：清空后长期记忆与设定保留，但剧情时间线会从头开始。')) return;
+                await hdsiApplyUpdate({ scriptClear: true, confirm: true }, '剧本已清空');
+                await hdsiLoadScript(true);
+            }
+
+            // ---------- 参与者 ----------
+            function hdsiRenderParticipants() {
+                const box = document.getElementById('hdsiParticipantList');
+                if (!box) return;
+                const participants = hdsiParticipants();
+                box.innerHTML = '';
+                if (!participants.length) { box.textContent = '（暂无参与者）'; return; }
+                participants.forEach(p => {
+                    const state = p.state || {};
+                    const card = document.createElement('div');
+                    card.style.cssText = 'border:1px solid #e6ece7;border-radius:10px;padding:10px;margin-bottom:10px;background:#fff;';
+                    card.innerHTML = `
+                        <div style="font-weight:bold;color:#2e3a33;">
+                            ${_hdsiEsc(p.displayName || p.userId || p.id)}
+                            <span style="color:#999;font-weight:normal;font-size:12px;">${_hdsiEsc(p.id)}</span>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
+                            <input type="text" data-f="displayName" value="${_hdsiEsc(p.displayName || '')}" placeholder="称呼" style="width:180px;">
+                            <select data-f="status" style="width:110px;">
+                                <option value="active"${p.status === 'active' ? ' selected' : ''}>active</option>
+                                <option value="paused"${p.status === 'paused' ? ' selected' : ''}>paused</option>
+                            </select>
+                        </div>
+                        <textarea data-f="profile" rows="2" style="width:100%;margin-top:6px;" placeholder="背景资料">${_hdsiEsc(p.profile || '')}</textarea>
+                        <textarea data-f="relationship" rows="2" style="width:100%;margin-top:6px;" placeholder="初始关系">${_hdsiEsc(p.relationship || '')}</textarea>
+                        <textarea data-f="openThreads" rows="2" style="width:100%;margin-top:6px;" placeholder="未决线索（每行一条）">${_hdsiEsc((state.openThreads || []).join('\n'))}</textarea>
+                        <textarea data-f="relationshipNotes" rows="2" style="width:100%;margin-top:6px;" placeholder="关系备注（每行一条）">${_hdsiEsc((state.relationshipNotes || []).join('\n'))}</textarea>
+                        <textarea data-f="relationshipOverlay" rows="2" style="width:100%;margin-top:6px;" placeholder="关系演化描述">${_hdsiEsc(state.relationshipOverlay || '')}</textarea>
+                        <div style="margin-top:6px;color:#999;font-size:12px;">
+                            未读 ${state.unreadMessageCount || 0} · 待回复 ${state.pendingReplyCount || 0}
+                            · 最近消息 ${_hdsiFmt(state.lastUserMessageAt)} · 最近发言 ${_hdsiFmt(state.lastCharacterMessageAt)}
+                        </div>
+                        <button type="button" class="tm-mini-btn" style="margin-top:6px;">保存参与者</button>`;
+                    card.querySelector('button').addEventListener('click', () => hdsiSaveParticipant(p.id, card));
+                    box.appendChild(card);
                 });
-                return { regimes, exceptions };
             }
-            async function tmClearPreplan() {
-                if (!currentTheaterName) return;
-                if (!confirm('清空日程（regimes + exceptions）？下次后台空闲时仍会重新审查。')) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ preplan_clear: true })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '清空失败'); return; }
-                    tmRenderPreplan({ version: 0, regimes: [], exceptions: [] });
-                    showTheaterError('✓ 已清空日程');
-                } catch (e) { showTheaterError('清空失败: ' + e); }
-            }
-
-            // ---------- 运行元数据 ----------
-            function tmRenderRuntime(state) {
-                const el = document.getElementById('tmRuntimeInfo');
-                if (!state) { el.innerHTML = '（无数据）'; return; }
-                const rows = [
-                    ['theater_id', state.theater_id],
-                    ['last_advance', _tmFmtTs(state.last_advance)],
-                    ['last_user', state.last_user || '—'],
-                    ['last_user_ts', _tmFmtTs(state.last_user_ts)],
-                    ['last_followup_ts', _tmFmtTs(state.last_followup_ts)],
-                    ['last_bubble_ts', _tmFmtTs(state.last_bubble_ts)],
-                    ['turns_since_refresh', state.turns_since_refresh],
-                    ['followup_done', JSON.stringify(state.followup_done || {})],
-                    ['updated_at', _tmFmtTs(state.updated_at)],
-                    ['last_proactive', JSON.stringify(state.last_proactive || {})],
-                    ['delivered_summary', (state.delivered_summary || []).length + ' 项'],
-                    ['mood.recent', (state.mood && state.mood.recent ? state.mood.recent.length : 0) + ' 个时间戳'],
-                    ['mood.last_analysis_ts', _tmFmtTs(state.mood && state.mood.last_analysis_ts)],
-                ];
-                el.innerHTML = rows.map(([k,v]) => `<div class="tm-runtime-row"><b>${_tmEsc(k)}</b>: <code>${_tmEsc(v)}</code></div>`).join('');
-            }
-            async function tmResetAdvance() {
-                if (!currentTheaterName) return;
-                if (!confirm('重置 last_advance=0？下一轮幕间推进线程会立即触发。')) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ runtime_reset: 'advance' })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '失败'); return; }
-                    if (d.theater) tmRenderRuntime(d.theater);
-                    showTheaterError('✓ 已重置推进时间');
-                } catch (e) { showTheaterError('失败: ' + e); }
-            }
-            async function tmResetAllTimestamps() {
-                if (!currentTheaterName) return;
-                if (!confirm('重置所有运行时间戳（last_advance/last_user_ts/last_followup_ts/last_bubble_ts/followup_done/turns_since_refresh）？')) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST', headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ runtime_reset: 'all' })
-                    });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '失败'); return; }
-                    if (d.theater) { tmCurrentState = d.theater; tmRenderRuntime(d.theater); }
-                    showTheaterError('✓ 已重置所有时间戳');
-                } catch (e) { showTheaterError('失败: ' + e); }
-            }
-            async function tmExportJSON() {
-                if (!currentTheaterName) return;
-                try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName));
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '导出失败'); return; }
-                    const blob = new Blob([JSON.stringify(d.theater, null, 2)], {type: 'application/json'});
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url; a.download = currentTheaterName + '.json';
-                    document.body.appendChild(a); a.click(); a.remove();
-                    URL.revokeObjectURL(url);
-                } catch (e) { showTheaterError('导出失败: ' + e); }
-            }
-
-            // ---------- 保存（一次性提交所有可编辑层） ----------
-            async function saveTheaterMemory() {
-                if (!currentTheaterName) return;
-                const payload = {
-                    // Canon + Perspective
-                    character: document.getElementById('tmCharacter').value,
-                    world: document.getElementById('tmWorld').value,
-                    scene: document.getElementById('tmScene').value,
-                    script_brief: document.getElementById('tmBrief').value,
-                    perspective: document.getElementById('tmPerspective').value,
-                    // Memory
-                    threads_text: document.getElementById('tmThreads').value,
-                    long_term_text: document.getElementById('tmLongTerm').value,
-                    // Overlay
-                    overlays_text: document.getElementById('tmOverlays').value,
-                    // Participants
-                    participants_text: document.getElementById('tmParticipants').value,
-                    // Status: continuity
-                    continuity: {
-                        current: document.getElementById('tmContinuityCurrent').value,
-                        next: _tmSplitLines(document.getElementById('tmContinuityNext').value),
-                        recent: _tmSplitLines(document.getElementById('tmContinuityRecent').value),
-                        salient: _tmSplitLines(document.getElementById('tmContinuitySalient').value),
-                    },
-                    // Status: consequences
-                    consequences_text: document.getElementById('tmConsequences').value,
-                    // Status: mood
-                    mood: {
-                        cumulative: parseInt(document.getElementById('tmMoodCumulative').value, 10) || 0,
-                        weight: parseFloat(document.getElementById('tmMoodWeight').value) || 0,
-                        direction: (() => {
-                            const v = document.getElementById('tmMoodDirection').value;
-                            return v === '' ? null : parseInt(v, 10);
-                        })(),
-                        description: document.getElementById('tmMoodDescription').value,
-                    },
-                    // Status: agency
-                    agency: {
-                        activityLoad: document.getElementById('tmAgencyLoad').value,
-                        privacy: document.getElementById('tmAgencyPrivacy').value,
-                        deviceAccess: document.getElementById('tmAgencyDevice').value,
-                        validMinutes: parseInt(document.getElementById('tmAgencyMinutes').value, 10) || 120,
-                        basis: document.getElementById('tmAgencyBasis').value,
-                    },
-                    // Presence
-                    presence_text: document.getElementById('tmPresence').value,
-                    // Preplan regimes & exceptions
-                    preplan: tmCollectPreplan(),
+            async function hdsiSaveParticipant(pid, card) {
+                const get = field => {
+                    const el = card.querySelector('[data-f="' + field + '"]');
+                    return el ? el.value : '';
                 };
                 try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(payload)
+                    await hdsiApi('/api/hdsi/participant/' + encodeURIComponent(pid), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            displayName: get('displayName'), profile: get('profile'),
+                            relationship: get('relationship'), status: get('status'),
+                            state: {
+                                openThreads: _hdsiLines(get('openThreads')),
+                                relationshipNotes: _hdsiLines(get('relationshipNotes')),
+                                relationshipOverlay: get('relationshipOverlay')
+                            }
+                        })
                     });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '保存失败'); return; }
-                    document.getElementById('tmAutoSaved').textContent = '✓ 已保存 ' + new Date().toLocaleTimeString();
-                    showTheaterError('✓ 保存成功');
-                    setTimeout(() => { const el = document.getElementById('editTheaterMemoryError'); if (el) el.style.display = 'none'; }, 1500);
-                    loadTheaterList();
-                    // 重读以刷新只读视图
-                    try {
-                        const r2 = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName));
-                        const d2 = await r2.json();
-                        if (d2.success) { tmCurrentState = d2.theater; tmPopulateAll(d2.theater); }
-                    } catch(_) {}
-                } catch (e) { showTheaterError('保存失败: ' + e); }
+                    hdsiStatus('参与者已保存');
+                } catch (e) {
+                    hdsiShowError('保存参与者失败：' + e.message);
+                }
             }
 
-            async function clearTheaterDoneIntents() {
-                if (!currentTheaterName) return;
+            // ---------- 场景 ----------
+            function hdsiRenderScenes() {
+                const scenes = hdsiBundle.scenes || [];
+                const sceneSelect = document.getElementById('hdsiSceneSelect');
+                if (sceneSelect) {
+                    sceneSelect.innerHTML = scenes.map(s =>
+                        `<option value="${s.id}">#${s.id} ${_hdsiEsc(s.status)} ${_hdsiFmt(s.startedAt)} ${_hdsiEsc((s.hook || '').slice(0, 40))}</option>`
+                    ).join('') || '<option value="">（无场景）</option>';
+                    const active = scenes.find(s => s.status === 'active') || scenes[0];
+                    if (active) sceneSelect.value = String(active.id);
+                }
+                const arcSelect = document.getElementById('hdsiArcSelect');
+                const arcs = hdsiBundle.arcs || [];
+                if (arcSelect) {
+                    arcSelect.innerHTML = arcs.map(a =>
+                        `<option value="${a.id}">#${a.id} ${_hdsiEsc(a.status)} ${_hdsiEsc(a.title || '')}</option>`
+                    ).join('') || '<option value="">（无弧线）</option>';
+                    if (arcs[0]) arcSelect.value = String(arcs[0].id);
+                }
+                hdsiFillSceneForm();
+                hdsiFillArcForm();
+                const history = document.getElementById('hdsiSceneHistory');
+                if (history) {
+                    history.innerHTML = scenes.length ? scenes.map(s =>
+                        `<div style="border-bottom:1px dashed #ddd;padding:4px 0;">
+                            #${s.id} <b>${_hdsiEsc(s.status)}</b> ${_hdsiFmt(s.startedAt)} ~ ${_hdsiFmt(s.endedAt)}
+                            · ${s.entryCount || 0} 条
+                            <div>${_hdsiEsc(s.summary || s.hook || '')}</div>
+                        </div>`).join('') : '（无）';
+                }
+            }
+            function hdsiFillSceneForm() {
+                const scenes = hdsiBundle.scenes || [];
+                const id = parseInt(_hdsiVal('hdsiSceneSelect'), 10);
+                const scene = scenes.find(s => s.id === id) || scenes[0];
+                if (scene) {
+                    _hdsiFill('hdsiSceneHook', scene.hook || '');
+                    _hdsiFill('hdsiSceneSummary', scene.summary || '');
+                }
+            }
+            function hdsiFillArcForm() {
+                const arcs = hdsiBundle.arcs || [];
+                const id = parseInt(_hdsiVal('hdsiArcSelect'), 10);
+                const arc = arcs.find(a => a.id === id) || arcs[0];
+                if (arc) {
+                    _hdsiFill('hdsiArcTitle', arc.title || '');
+                    _hdsiFill('hdsiArcSummary', arc.summary || '');
+                }
+            }
+            async function hdsiSaveScene() {
+                const id = parseInt(_hdsiVal('hdsiSceneSelect'), 10);
+                if (!id) return;
+                await hdsiApplyUpdate({ scene: { id: id, hook: _hdsiVal('hdsiSceneHook'), summary: _hdsiVal('hdsiSceneSummary') } }, '场景已保存');
+            }
+            async function hdsiSaveArc() {
+                const id = parseInt(_hdsiVal('hdsiArcSelect'), 10);
+                if (!id) return;
+                await hdsiApplyUpdate({ arc: { id: id, title: _hdsiVal('hdsiArcTitle'), summary: _hdsiVal('hdsiArcSummary') } }, '弧线已保存');
+            }
+
+            // ---------- 记忆 ----------
+            let hdsiMemories = [];
+            async function hdsiLoadMemories() {
+                if (!hdsiStoryId) return;
                 try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(currentTheaterName), {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ clear_done_intents: true })
+                    const data = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/memories');
+                    hdsiMemories = data.memories || [];
+                    hdsiRenderMemories();
+                } catch (e) {
+                    hdsiShowError('加载记忆失败：' + e.message);
+                }
+            }
+            function hdsiRenderMemories() {
+                const box = document.getElementById('hdsiMemoryList');
+                if (!box) return;
+                if (!hdsiMemories.length) { box.textContent = '（无记忆条目）'; return; }
+                box.innerHTML = '';
+                hdsiMemories.forEach(m => {
+                    const item = document.createElement('div');
+                    item.className = 'tm-script-item';
+                    item.innerHTML = `
+                        <div class="tm-script-meta">#${m.id} · ${_hdsiEsc(m.category)} · importance ${m.importance} · ${_hdsiEsc(m.status)}
+                            ${m.participantId ? ' · ' + _hdsiEsc(m.participantId) : ''} · ${_hdsiFmt(m.updatedAt || m.createdAt)}</div>
+                        <div class="tm-script-content">${_hdsiEsc(m.content)}</div>
+                        <div style="margin-top:4px;display:flex;gap:6px;">
+                            <button type="button" class="tm-mini-btn tm-warn">归档</button>
+                            <button type="button" class="tm-mini-btn tm-danger">删除</button>
+                        </div>`;
+                    const buttons = item.querySelectorAll('button');
+                    buttons[0].addEventListener('click', () => hdsiMemoryAction('supersede', m.id));
+                    buttons[1].addEventListener('click', () => hdsiMemoryAction('deletes', m.id));
+                    box.appendChild(item);
+                });
+            }
+            async function hdsiAddMemory() {
+                const content = _hdsiVal('hdsiMemContent');
+                if (!content.trim()) { hdsiShowError('记忆内容不能为空'); return; }
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/memories', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ add: [{
+                            category: _hdsiVal('hdsiMemCategory') || 'event', content: content,
+                            importance: parseFloat(_hdsiVal('hdsiMemImportance') || '0.5'),
+                            participantId: _hdsiVal('hdsiMemParticipant')
+                        }] })
                     });
-                    const d = await r.json();
-                    if (!d.success) { showTheaterError(d.message || '清理失败'); return; }
-                    if (d.theater && d.theater.intents) tmRenderIntents(d.theater.intents);
-                    else tmRefreshIntentsOnly();
-                    showTheaterError('✓ 已清理已完成意图');
-                } catch (e) { showTheaterError('清理失败: ' + e); }
+                    _hdsiFill('hdsiMemContent', '');
+                    await hdsiLoadMemories();
+                    hdsiStatus('记忆已添加');
+                } catch (e) {
+                    hdsiShowError('添加记忆失败：' + e.message);
+                }
             }
-            async function deleteTheater(name) {
-                if (!confirm(`确定要删除剧场「${name}」吗？该剧场的生活剧本将被永久删除，不可恢复。`)) return;
+            async function hdsiMemoryAction(action, id) {
+                if (action === 'deletes' && !confirm('删除这条记忆？')) return;
                 try {
-                    const r = await fetch('/api/theater/' + encodeURIComponent(name), { method: 'DELETE' });
-                    const d = await r.json();
-                    if (!d.success) { alert('删除失败: ' + (d.message || '未知错误')); return; }
-                    if (currentTheaterName === name) closeEditTheaterMemoryModal();
-                    alert('已删除剧场「' + name + '」');
-                    loadTheaterList();
-                } catch (e) { alert('删除失败: ' + e); }
+                    const body = {}; body[action] = [id];
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/memories', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
+                    await hdsiLoadMemories();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
             }
-            function closeEditTheaterMemoryModal() {
-                document.getElementById('editTheaterMemoryModal').style.display = 'none';
-                tmCurrentState = null;
+            async function hdsiClearArchivedMemories() {
+                if (!confirm('清空所有已归档（superseded）记忆？')) return;
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/memories', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ clearArchived: true })
+                    });
+                    await hdsiLoadMemories();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
             }
-            // 关键：本脚本整体包裹在 DOMContentLoaded 回调内，函数默认不是全局的。
-            // 弹窗/面板里使用内联 onclick="fn()" 的处理器需要全局函数，必须显式挂到 window。
-            window.loadTheaterList = loadTheaterList;
-            window.newTheater = newTheater;
-            window.editTheaterMemory = editTheaterMemory;
-            window.saveTheaterMemory = saveTheaterMemory;
-            window.clearTheaterDoneIntents = clearTheaterDoneIntents;
-            window.deleteTheater = deleteTheater;
-            window.closeEditTheaterMemoryModal = closeEditTheaterMemoryModal;
-            window.showTheaterError = showTheaterError;
-            window.tmSwitchTab = tmSwitchTab;
-            window.tmLoadTimeline = tmLoadTimeline;
-            window.tmLoadMoreScript = tmLoadMoreScript;
-            window.tmClearScript = tmClearScript;
-            window.tmClearOverlayLayer = tmClearOverlayLayer;
-            window.tmRenderIntents = tmRenderIntents;
-            window.tmAddIntent = tmAddIntent;
-            window.tmDeleteIntent = tmDeleteIntent;
-            window.tmMarkIntentDone = tmMarkIntentDone;
-            window.tmRefreshIntentsOnly = tmRefreshIntentsOnly;
-            window.tmRenderSummary = tmRenderSummary;
-            window.tmClearStorySummary = tmClearStorySummary;
-            window.tmRenderPreplan = tmRenderPreplan;
-            window.tmAddRegime = tmAddRegime;
-            window.tmAddException = tmAddException;
-            window.tmClearPreplan = tmClearPreplan;
-            window.tmRenderRuntime = tmRenderRuntime;
-            window.tmResetAdvance = tmResetAdvance;
-            window.tmResetAllTimestamps = tmResetAllTimestamps;
-            window.tmExportJSON = tmExportJSON;
-            window.tmPopulateAll = tmPopulateAll;
-            window.tmCollectPreplan = tmCollectPreplan;
+
+            // ---------- 长期事实 ----------
+            let hdsiFacts = [];
+            async function hdsiLoadFacts() {
+                if (!hdsiStoryId) return;
+                try {
+                    const data = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/facts');
+                    hdsiFacts = data.facts || [];
+                    hdsiRenderFacts();
+                } catch (e) {
+                    hdsiShowError('加载事实失败：' + e.message);
+                }
+            }
+            function hdsiRenderFacts() {
+                const box = document.getElementById('hdsiFactList');
+                if (!box) return;
+                const showArchived = document.getElementById('hdsiFactShowArchived');
+                const items = hdsiFacts.filter(f => showArchived && showArchived.checked ? true : f.status === 'active');
+                if (!items.length) { box.textContent = '（无长期事实）'; return; }
+                box.innerHTML = '';
+                items.forEach(f => {
+                    const item = document.createElement('div');
+                    item.className = 'tm-script-item';
+                    item.innerHTML = `
+                        <div class="tm-script-meta">#${f.id} · <b>${_hdsiEsc(f.scope)}</b> · importance ${f.importance} · confidence ${f.confidence}
+                            · ${f.unresolved ? '<span style="color:#e65100;">未解决</span>' : '已解决'} · ${_hdsiEsc(f.status)}
+                            ${f.participantId ? ' · ' + _hdsiEsc(f.participantId) : ''} · ${_hdsiFmt(f.updatedAt || f.createdAt)}</div>
+                        <div class="tm-script-content">${_hdsiEsc(f.content)}</div>
+                        <div style="margin-top:4px;display:flex;gap:6px;">
+                            <button type="button" class="tm-mini-btn tm-warn">${f.status === 'active' ? '忘记' : '恢复'}</button>
+                            <button type="button" class="tm-mini-btn tm-danger">删除</button>
+                        </div>`;
+                    const buttons = item.querySelectorAll('button');
+                    buttons[0].addEventListener('click', () => hdsiFactAction(f.status === 'active' ? 'forget' : 'restore', f.id));
+                    buttons[1].addEventListener('click', () => hdsiFactAction('deletes', f.id));
+                    box.appendChild(item);
+                });
+            }
+            async function hdsiAddFact() {
+                const content = _hdsiVal('hdsiFactContent');
+                if (!content.trim()) { hdsiShowError('事实内容不能为空'); return; }
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/facts', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ add: [{
+                            scope: _hdsiVal('hdsiFactScope') || 'event', content: content,
+                            importance: parseFloat(_hdsiVal('hdsiFactImportance') || '0.5'),
+                            confidence: parseFloat(_hdsiVal('hdsiFactConfidence') || '0.8'),
+                            unresolved: !!(document.getElementById('hdsiFactUnresolved') || {}).checked,
+                            participantId: _hdsiVal('hdsiFactParticipant')
+                        }] })
+                    });
+                    _hdsiFill('hdsiFactContent', '');
+                    await hdsiLoadFacts();
+                    hdsiStatus('长期事实已添加');
+                } catch (e) {
+                    hdsiShowError('添加事实失败：' + e.message);
+                }
+            }
+            async function hdsiFactAction(action, id) {
+                if (action === 'deletes' && !confirm('物理删除这条事实？')) return;
+                try {
+                    const body = {}; body[action] = [id];
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/facts', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
+                    await hdsiLoadFacts();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
+            }
+
+            // ---------- 意图 ----------
+            let hdsiIntents = [];
+            async function hdsiLoadIntents() {
+                if (!hdsiStoryId) return;
+                try {
+                    const data = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/intents');
+                    hdsiIntents = data.intents || [];
+                    hdsiRenderIntents();
+                } catch (e) {
+                    hdsiShowError('加载意图失败：' + e.message);
+                }
+            }
+            function hdsiRenderIntents() {
+                const box = document.getElementById('hdsiIntentList');
+                if (!box) return;
+                if (!hdsiIntents.length) { box.textContent = '（无意图）'; return; }
+                box.innerHTML = '';
+                hdsiIntents.forEach(it => {
+                    const statusColor = it.status === 'pending' ? '#2e7d32' : (it.status === 'completed' ? '#1565c0' : '#999');
+                    const item = document.createElement('div');
+                    item.className = 'tm-script-item';
+                    item.innerHTML = `
+                        <div class="tm-script-meta">#${it.id} · <b>${_hdsiEsc(it.type)}</b>
+                            · <span style="color:${statusColor};">${_hdsiEsc(it.status)}</span>
+                            · 到期 ${_hdsiFmt(it.notBefore)}
+                            ${it.participantId ? ' · ' + _hdsiEsc(it.participantId) : ''}</div>
+                        <div class="tm-script-content">${_hdsiEsc(it.summary)}</div>
+                        <div style="margin-top:4px;display:flex;gap:6px;">
+                            <button type="button" class="tm-mini-btn tm-warn">取消</button>
+                            <button type="button" class="tm-mini-btn">完成</button>
+                            <button type="button" class="tm-mini-btn tm-danger">删除</button>
+                        </div>`;
+                    const buttons = item.querySelectorAll('button');
+                    buttons[0].addEventListener('click', () => hdsiIntentAction('cancel', it.id));
+                    buttons[1].addEventListener('click', () => hdsiIntentAction('complete', it.id));
+                    buttons[2].addEventListener('click', () => hdsiIntentAction('deletes', it.id));
+                    box.appendChild(item);
+                });
+            }
+            async function hdsiAddIntent() {
+                const summary = _hdsiVal('hdsiIntentSummary');
+                if (!summary.trim()) { hdsiShowError('意图内容不能为空'); return; }
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/intents', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ add: [{
+                            type: _hdsiVal('hdsiIntentType') || 'delayed-reply', summary: summary,
+                            minutes: parseInt(_hdsiVal('hdsiIntentMinutes') || '30', 10),
+                            participantId: _hdsiVal('hdsiIntentParticipant')
+                        }] })
+                    });
+                    _hdsiFill('hdsiIntentSummary', '');
+                    await hdsiLoadIntents();
+                    hdsiStatus('意图已添加');
+                } catch (e) {
+                    hdsiShowError('添加意图失败：' + e.message);
+                }
+            }
+            async function hdsiIntentAction(action, id) {
+                if (action === 'deletes' && !confirm('物理删除这条意图？')) return;
+                try {
+                    const body = {}; body[action] = [id];
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/intents', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
+                    await hdsiLoadIntents();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
+            }
+            async function hdsiClearDoneIntents() {
+                if (!confirm('清除全部已完成 / 已取消的意图？')) return;
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId) + '/intents', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ clearDone: true })
+                    });
+                    await hdsiLoadIntents();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
+            }
+
+            // ---------- 状态 ----------
+            function hdsiRenderState() {
+                const state = hdsiState();
+                const continuity = state.continuitySnapshot || {};
+                _hdsiFill('hdsiContinuityCurrent', continuity.current);
+                _hdsiFill('hdsiContinuityRecent', (continuity.recent || []).join('\n'));
+                _hdsiFill('hdsiContinuitySalient', (continuity.salient || []).join('\n'));
+                const automation = state.automation || {};
+                const autoBox = document.getElementById('hdsiAutomationInfo');
+                if (autoBox) {
+                    autoBox.innerHTML = Object.keys(automation).length
+                        ? Object.keys(automation).map(k => `<div><b>${_hdsiEsc(k)}</b>: ${_hdsiEsc(JSON.stringify(automation[k]))}</div>`).join('')
+                        : '（空）';
+                }
+                const alter = state.alterSystem || {};
+                _hdsiFill('hdsiAlterValue', alter.alterValue != null ? alter.alterValue : 0);
+                _hdsiFill('hdsiAlterWeight', alter.alterWeight != null ? alter.alterWeight : 0);
+                const offset = alter.emotionalOffset || {};
+                _hdsiFill('hdsiAlterDirection', offset.direction === 'serious' ? 'serious' : 'relaxed');
+                _hdsiFill('hdsiAlterIntensity', offset.intensity != null ? offset.intensity : 1);
+                _hdsiFill('hdsiAlterDescription', offset.description || '');
+                const agency = state.agencyWindow || {};
+                _hdsiFill('hdsiAgencyLoad', agency.activityLoad || 'free');
+                _hdsiFill('hdsiAgencyPrivacy', agency.privacy || 'private');
+                _hdsiFill('hdsiAgencyDevice', agency.deviceAccess || 'available');
+                _hdsiFill('hdsiAgencyBasis', agency.basis || '');
+                const presenceBox = document.getElementById('hdsiPresenceInfo');
+                if (presenceBox) {
+                    const presence = state.scenePresence || [];
+                    presenceBox.innerHTML = presence.length ? presence.map(p => `
+                        <div><b>${_hdsiEsc(p.name)}</b> · ${_hdsiEsc(p.status)} · ${_hdsiEsc(p.basis || '')}
+                        · 证据 #${(p.sourceEntryIds || []).join(',#')}</div>`).join('') : '（无）';
+                }
+                const details = state.workingDetails || [];
+                _hdsiFill('hdsiWorkingDetails', details.map(d =>
+                    [d.label, d.value, d.expiresAt || ''].join('|')).join('\n'));
+                _hdsiFill('hdsiTimelineCarry', (state.timelineCarry || []).join('\n'));
+                const deliveryBox = document.getElementById('hdsiDeliverySummaries');
+                if (deliveryBox) {
+                    const summaries = state.automaticDeliverySummaries || [];
+                    deliveryBox.innerHTML = summaries.length ? summaries.map(s =>
+                        `<div>${_hdsiFmt(s.deliveredAt)} · ${_hdsiEsc(s.summary)}</div>`).join('') : '（无）';
+                }
+            }
+            async function hdsiSaveContinuity() {
+                await hdsiApplyUpdate({ continuity: {
+                    current: _hdsiVal('hdsiContinuityCurrent'),
+                    recent: _hdsiLines(_hdsiVal('hdsiContinuityRecent')),
+                    salient: _hdsiLines(_hdsiVal('hdsiContinuitySalient'))
+                } }, '状态摘要已保存');
+            }
+            async function hdsiResetAdvance() {
+                if (!confirm('把推进时钟拨到"立即到期"，让后台下一轮扫描马上补写一段生活？')) return;
+                await hdsiApplyUpdate({ runtimeReset: 'advance' }, '已请求立即推进');
+            }
+            async function hdsiResetAutomation() {
+                if (!confirm('清空推进时钟（nextAdvanceAt/安静期/后续计划）？')) return;
+                await hdsiApplyUpdate({ automationReset: true }, '推进时钟已清空');
+            }
+            async function hdsiSaveAlter() {
+                await hdsiApplyUpdate({ alterSystem: {
+                    alterValue: parseFloat(_hdsiVal('hdsiAlterValue') || '0'),
+                    alterWeight: parseFloat(_hdsiVal('hdsiAlterWeight') || '0'),
+                    emotionalOffset: {
+                        direction: _hdsiVal('hdsiAlterDirection'),
+                        description: _hdsiVal('hdsiAlterDescription'),
+                        intensity: parseFloat(_hdsiVal('hdsiAlterIntensity') || '1')
+                    }
+                } }, '情绪状态已保存');
+            }
+            async function hdsiClearAlter() {
+                if (!confirm('清空 Alter 情绪累计与偏移描述？')) return;
+                await hdsiApplyUpdate({ alterSystem: { clear: true } }, '情绪状态已清空');
+            }
+            async function hdsiSaveAgency() {
+                await hdsiApplyUpdate({ agencyWindow: {
+                    activityLoad: _hdsiVal('hdsiAgencyLoad'),
+                    privacy: _hdsiVal('hdsiAgencyPrivacy'),
+                    deviceAccess: _hdsiVal('hdsiAgencyDevice'),
+                    validMinutes: parseInt(_hdsiVal('hdsiAgencyMinutes') || '240', 10),
+                    basis: _hdsiVal('hdsiAgencyBasis')
+                } }, '行动窗口已保存');
+            }
+            async function hdsiClearAgency() {
+                if (!confirm('清空行动窗口？')) return;
+                await hdsiApplyUpdate({ agencyWindow: null }, '行动窗口已清空');
+            }
+            async function hdsiClearPresence() {
+                if (!confirm('清空在场表？')) return;
+                await hdsiApplyUpdate({ scenePresenceClear: true }, '在场表已清空');
+            }
+            async function hdsiSaveWorkingDetails() {
+                const details = _hdsiLines(_hdsiVal('hdsiWorkingDetails')).map(line => {
+                    const parts = line.split('|');
+                    return { label: (parts[0] || '').trim(), value: (parts[1] || '').trim(), expiresAt: (parts[2] || '').trim() };
+                }).filter(d => d.label && d.value);
+                await hdsiApplyUpdate({ workingDetails: details }, '手头小事已保存');
+            }
+            async function hdsiSaveTimelineCarry() {
+                await hdsiApplyUpdate({ timelineCarry: _hdsiLines(_hdsiVal('hdsiTimelineCarry')) }, '未决线索已保存');
+            }
+
+            // ---------- 日程 ----------
+            function hdsiRenderPreplan() {
+                const record = hdsiBundle.preplan;
+                const info = document.getElementById('hdsiPreplanInfo');
+                if (info) {
+                    info.innerHTML = record ? `
+                        <div>revision：${record.revision || 0} · 有效 ${_hdsiEsc(record.validFrom || '')} ~ ${_hdsiEsc(record.validThrough || '')}</div>
+                        <div>上次审查：${_hdsiEsc(record.lastReviewedLocalDate || '—')} · 原因：${_hdsiEsc(record.reviewReason || '')}</div>
+                        <div>周规律 ${(record.regimes || []).length} 组 · 日期例外 ${(record.exceptions || []).length} 条 · 已展开 ${(record.materializedDays || []).length} 天</div>`
+                        : '（尚无日程记录：后台完成一次审查后生成）';
+                }
+                _hdsiFill('hdsiPreplanRegimes', record ? JSON.stringify(record.regimes || [], null, 2) : '');
+                _hdsiFill('hdsiPreplanExceptions', record ? JSON.stringify(record.exceptions || [], null, 2) : '');
+            }
+            async function hdsiSavePreplanJson() {
+                let regimes = null;
+                let exceptions = null;
+                try {
+                    if (_hdsiVal('hdsiPreplanRegimes').trim()) regimes = JSON.parse(_hdsiVal('hdsiPreplanRegimes'));
+                    if (_hdsiVal('hdsiPreplanExceptions').trim()) exceptions = JSON.parse(_hdsiVal('hdsiPreplanExceptions'));
+                } catch (e) {
+                    hdsiShowError('日程 JSON 解析失败：' + e.message);
+                    return;
+                }
+                if (!hdsiBundle.preplan) { hdsiShowError('当前没有日程记录，无法保存 JSON。'); return; }
+                await hdsiApplyUpdate({ preplan: { regimes: regimes || [], exceptions: exceptions || [] } }, '日程 JSON 已保存');
+            }
+            async function hdsiRebuildPreplan() {
+                if (!hdsiBundle.preplan) { hdsiShowError('当前没有日程记录。'); return; }
+                if (!confirm('请求后台重新审查该剧场的日程？')) return;
+                await hdsiApplyUpdate({ preplanRebuild: true }, '已请求重新审查');
+            }
+            async function hdsiClearPreplan() {
+                if (!confirm('清空该剧场的日程记录？')) return;
+                await hdsiApplyUpdate({ preplanClear: true }, '日程已清空');
+            }
+
+            // ---------- 运行信息 ----------
+            function hdsiRenderRuntime() {
+                const story = hdsiBundle.story || {};
+                const state = story.state || {};
+                const counts = story.counts || {};
+                const box = document.getElementById('hdsiRuntimeInfo');
+                if (box) {
+                    box.innerHTML = `
+                        <div>故事 ID：${_hdsiEsc(story.id)} · 状态：${_hdsiEsc(story.status)} · 平台：${_hdsiEsc(story.platform || '')} · 账号：${_hdsiEsc(story.selfId || '')}</div>
+                        <div>游标 cursorAt：${_hdsiFmt(story.cursorAt)} · 创建：${_hdsiFmt(story.createdAt)} · 更新：${_hdsiFmt(story.updatedAt)}</div>
+                        <div>叙事更新次数：${state.narrativeUpdateCount || 0} · 剧本 ${counts.entries || 0} · 记忆 ${counts.memories || 0} · 事实 ${counts.facts || 0} · 意图 ${counts.intents || 0}</div>
+                        <div>场景 ${counts.scenes || 0} · 弧线 ${counts.arcs || 0} · 设定补丁 ${counts.patches || 0} · Overlay 快照 ${counts.snapshots || 0} · 网页观察 ${counts.observations || 0}</div>
+                        <div>continuityDirty：${state.continuityDirty ? 'true' : 'false'} · 最近 continuity：${_hdsiEsc((state.continuitySnapshot || {}).current || '—')}</div>`;
+                }
+                const patchBox = document.getElementById('hdsiPatchList');
+                if (patchBox) {
+                    const patches = hdsiBundle.patches || [];
+                    if (!patches.length) { patchBox.textContent = '（无设定补丁）'; }
+                    else {
+                        patchBox.innerHTML = '';
+                        patches.forEach(p => {
+                            const item = document.createElement('div');
+                            item.className = 'tm-script-item';
+                            item.innerHTML = `
+                                <div class="tm-script-meta">#${p.id} · ${_hdsiEsc(p.target)}.${_hdsiEsc(p.path)} · confidence ${p.confidence}
+                                    · impact ${_hdsiEsc(p.impact || '')} · <b>${_hdsiEsc(p.status)}</b> · ${_hdsiFmt(p.createdAt)}</div>
+                                <div class="tm-script-content">提出值：${_hdsiEsc(p.proposedValue)}<br>证据：${_hdsiEsc(p.evidence)}</div>
+                                <div style="margin-top:4px;display:flex;gap:6px;">
+                                    <button type="button" class="tm-mini-btn tm-warn">驳回</button>
+                                    <button type="button" class="tm-mini-btn">清除</button>
+                                </div>`;
+                            const buttons = item.querySelectorAll('button');
+                            buttons[0].addEventListener('click', () => hdsiPatchAction(p.id, 'reject'));
+                            buttons[1].addEventListener('click', () => hdsiPatchAction(p.id, 'clear'));
+                            patchBox.appendChild(item);
+                        });
+                    }
+                }
+                const frameBox = document.getElementById('hdsiFrameInfo');
+                if (frameBox) {
+                    frameBox.innerHTML = `
+                        <div><b>sceneFrame</b>：${_hdsiEsc(JSON.stringify(state.sceneFrame || null))}</div>
+                        <div><b>dialogueBurst</b>：${_hdsiEsc(JSON.stringify(state.dialogueBurst || null))}</div>
+                        <div><b>chatRhythm</b>：${_hdsiEsc(JSON.stringify(state.chatRhythm || null))}</div>`;
+                }
+            }
+            async function hdsiPatchAction(id, action) {
+                try {
+                    const data = await hdsiApi(`/api/hdsi/story/${encodeURIComponent(hdsiStoryId)}/patches/${id}`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action })
+                    });
+                    hdsiStatus(data.message || '已处理');
+                    hdsiBundle = await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId));
+                    hdsiRenderAll();
+                } catch (e) {
+                    hdsiShowError('操作失败：' + e.message);
+                }
+            }
+            async function hdsiResetRuntimeAll() {
+                if (!confirm('重置运行状态（推进时钟/情绪/行动窗口/手头小事/场景帧）？设定与记忆不受影响。')) return;
+                await hdsiApplyUpdate({ runtimeReset: 'all' }, '运行状态已重置');
+            }
+            function hdsiExportStory() {
+                const blob = new Blob([JSON.stringify(hdsiBundle, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'hdsi_story_' + String(hdsiStoryId || 'export').replace(/[\\/:*?"<>|]/g, '_') + '.json';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }
+            async function hdsiDeleteStory() {
+                if (!confirm('删除这个剧场？将清空它的剧本、记忆、事实、意图、场景等全部数据。')) return;
+                if (!confirm('再次确认：此操作不可撤销。')) return;
+                try {
+                    await hdsiApi('/api/hdsi/story/' + encodeURIComponent(hdsiStoryId), {
+                        method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true })
+                    });
+                    hdsiCloseStory();
+                    await hdsiLoadStories();
+                } catch (e) {
+                    hdsiShowError('删除失败：' + e.message);
+                }
+            }
+            async function hdsiSaveAll() {
+                await hdsiSaveCanon();
+                await hdsiApplyUpdate({
+                    settingOverlay: {
+                        characterProfile: _hdsiVal('hdsiOverlayCharacter'),
+                        perspective: _hdsiVal('hdsiOverlayPerspective'),
+                        relationship: _hdsiVal('hdsiOverlayRelationship'),
+                        world: _hdsiVal('hdsiOverlayWorld'),
+                        supportingCast: _hdsiVal('hdsiOverlayCast'),
+                        location: _hdsiVal('hdsiOverlayLocation'),
+                        characterTraits: _hdsiLines(_hdsiVal('hdsiOverlayTraits'))
+                    },
+                    continuity: {
+                        current: _hdsiVal('hdsiContinuityCurrent'),
+                        recent: _hdsiLines(_hdsiVal('hdsiContinuityRecent')),
+                        salient: _hdsiLines(_hdsiVal('hdsiContinuitySalient'))
+                    }
+                }, '设定 / 演化 / 状态已保存');
+            }
+            function hdsiFillParticipantSelects() {
+                const options = ['<option value="">（全局/不指定）</option>'].concat(
+                    hdsiParticipants().map(p =>
+                        `<option value="${_hdsiEsc(p.id)}">${_hdsiEsc(p.displayName || p.userId || p.id)}</option>`)
+                ).join('');
+                ['hdsiMemParticipant', 'hdsiFactParticipant', 'hdsiIntentParticipant'].forEach(id => {
+                    const select = document.getElementById(id);
+                    if (select) select.innerHTML = options;
+                });
+            }
+            document.querySelectorAll('#hdsiTabs .tm-tab-btn').forEach(btn => {
+                btn.addEventListener('click', () => hdsiSwitchTab(btn.dataset.tab));
+            });
+
+            window.hdsiLoadStories = hdsiLoadStories;
+            window.hdsiRenderStoryList = hdsiRenderStoryList;
+            window.hdsiNewStory = hdsiNewStory;
+            window.hdsiOpenStory = hdsiOpenStory;
+            window.hdsiCloseStory = hdsiCloseStory;
+            window.hdsiSwitchTab = hdsiSwitchTab;
+            window.hdsiSaveCanon = hdsiSaveCanon;
+            window.hdsiSaveOverlay = hdsiSaveOverlay;
+            window.hdsiClearOverlay = hdsiClearOverlay;
+            window.hdsiLoadScript = hdsiLoadScript;
+            window.hdsiClearScript = hdsiClearScript;
+            window.hdsiFillSceneForm = hdsiFillSceneForm;
+            window.hdsiFillArcForm = hdsiFillArcForm;
+            window.hdsiSaveScene = hdsiSaveScene;
+            window.hdsiSaveArc = hdsiSaveArc;
+            window.hdsiLoadMemories = hdsiLoadMemories;
+            window.hdsiAddMemory = hdsiAddMemory;
+            window.hdsiClearArchivedMemories = hdsiClearArchivedMemories;
+            window.hdsiLoadFacts = hdsiLoadFacts;
+            window.hdsiRenderFacts = hdsiRenderFacts;
+            window.hdsiAddFact = hdsiAddFact;
+            window.hdsiLoadIntents = hdsiLoadIntents;
+            window.hdsiAddIntent = hdsiAddIntent;
+            window.hdsiClearDoneIntents = hdsiClearDoneIntents;
+            window.hdsiSaveContinuity = hdsiSaveContinuity;
+            window.hdsiResetAdvance = hdsiResetAdvance;
+            window.hdsiResetAutomation = hdsiResetAutomation;
+            window.hdsiSaveAlter = hdsiSaveAlter;
+            window.hdsiClearAlter = hdsiClearAlter;
+            window.hdsiSaveAgency = hdsiSaveAgency;
+            window.hdsiClearAgency = hdsiClearAgency;
+            window.hdsiClearPresence = hdsiClearPresence;
+            window.hdsiSaveWorkingDetails = hdsiSaveWorkingDetails;
+            window.hdsiSaveTimelineCarry = hdsiSaveTimelineCarry;
+            window.hdsiSavePreplanJson = hdsiSavePreplanJson;
+            window.hdsiRebuildPreplan = hdsiRebuildPreplan;
+            window.hdsiClearPreplan = hdsiClearPreplan;
+            window.hdsiResetRuntimeAll = hdsiResetRuntimeAll;
+            window.hdsiExportStory = hdsiExportStory;
+            window.hdsiDeleteStory = hdsiDeleteStory;
+            window.hdsiSaveAll = hdsiSaveAll;
+
+            // 页面加载后先拉一次剧场列表（同时触发旧 JSON 归档）
+            hdsiLoadStories();
 
 
             async function initBotStatus() {
@@ -2871,7 +3121,7 @@
                     }
 
                     if (targetId === 'section-theater-memory') { // 切换到剧场记忆tab
-                        loadTheaterList(); // 立即刷新剧场列表
+                        hdsiLoadStories(); // 立即刷新剧场列表
                     }
 
                     if (sidebarElement && sidebarOverlayElement && window.innerWidth <= 768) {
@@ -4383,191 +4633,194 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                 </div>
 
                 <div id="section-theater" class="content-panel">
-                    <h2>剧场系统（让 AI 成为演员）</h2>
+                    <h2>剧场系统（HDS-Interlude 引擎）</h2>
+                    <div class="form-group">
+                        <small>剧场引擎是 <b>hds-interlude 1.0.1-beta6-rebuild</b> 的 Python 移植版（hdsi/）：
+                        每段聊天/群聊维护一部持续上演的生活剧本，包含幕间推进、对话后续、到期意图、承诺回访、
+                        情绪偏移（Alter）、行动窗口（Agency）、日程预判与记忆压缩。数据保存在 Theater/hdsi.sqlite3。</small>
+                    </div>
+
+                    <h3 style="margin-top:18px;">① 引擎与模型</h3>
                     <div class="form-group">
                         <div class="switch-item">
                             <label>启用剧场系统</label>
                             <div class="switch"><label class="switch-label"><input type="checkbox" name="ENABLE_THEATER" {% if config.ENABLE_THEATER %}checked{% endif %}><span class="slider round"></span></label></div>
                         </div>
-                        <small>开启后，AI 作为"演员"维护一部持续上演的生活剧本：每次对话补写幕间经历、决定回复/沉默/延迟，并在幕间自动生活、主动联系（参考 HDS-Interlude 思路）。</small>
+                        <small>开启后，勾选「剧场」的聊天由 hdsi 引擎接管叙事与投递。</small>
                     </div>
                     <div class="form-group">
                         <label for="theaterDirInput">剧本数据目录:</label>
                         <input type="text" id="theaterDirInput" name="THEATER_DIR" value="{{ config.THEATER_DIR }}" placeholder="Theater">
-                        <small>每个角色的生活剧本会持久化到该目录下的 JSON 文件，重启后无缝续演。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterAdvanceInput">幕间推进间隔 (分钟):</label>
-                        <input type="number" min="1" id="theaterAdvanceInput" name="THEATER_ADVANCE_INTERVAL_MINUTES" value="{{ config.THEATER_ADVANCE_INTERVAL_MINUTES }}">
-                        <small>没有消息时，角色也在"幕间生活"，按此间隔推进剧情。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterProactiveInput">主动联系意愿阈值 (0-100):</label>
-                        <input type="number" min="0" max="100" id="theaterProactiveInput" name="THEATER_PROACTIVE_THRESHOLD" value="{{ config.THEATER_PROACTIVE_THRESHOLD }}">
-                        <small>角色想主动找你的意愿达到该值，才会真的主动发消息。</small>
-                    </div>
-                    <div class="form-group">
-                        <div class="switch-item">
-                            <label>尊重安静时间</label>
-                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_RESPECT_QUIET_TIME" {% if config.THEATER_RESPECT_QUIET_TIME %}checked{% endif %}><span class="slider round"></span></label></div>
-                        </div>
-                        <small>安静时间（22:00-8:00）内不自动推进、不主动联系、不投递延迟消息。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterBudgetInput">剧本上下文保留条数:</label>
-                        <input type="number" min="5" id="theaterBudgetInput" name="THEATER_SCRIPT_BUDGET" value="{{ config.THEATER_SCRIPT_BUDGET }}">
-                        <small>每次写作喂给模型的近期剧本长度。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterRecentInput">回复参考的最近聊天记录条数:</label>
-                        <input type="number" min="1" id="theaterRecentInput" name="THEATER_RECENT_CONTEXT" value="{{ config.THEATER_RECENT_CONTEXT }}">
-                        <small>剧场模式下，回复前把该聊天最近 N 条真实对话单独高亮给模型，让它自然接话。</small>
-                    </div>
-                    <div class="form-group">
-                        <div class="switch-item">
-                            <label>Alter 心情惯性</label>
-                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_ALTER_ENABLED" {% if config.THEATER_ALTER_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
-                        </div>
-                        <small>每回合氛围净变化累计超过阈值后，生成"情绪偏移描述"注入后续回合，让角色有心情惯性。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterAlterThresholdInput">Alter 触发阈值:</label>
-                        <input type="number" min="1" id="theaterAlterThresholdInput" name="THEATER_ALTER_BASE_THRESHOLD" value="{{ config.THEATER_ALTER_BASE_THRESHOLD }}">
-                        <small>值越小越敏感（默认 10，对话密集时自适应降低）。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterProactiveIntervalInput">主动联系最小间隔 (分钟):</label>
-                        <input type="number" min="0" id="theaterProactiveIntervalInput" name="THEATER_MIN_PROACTIVE_INTERVAL_MINUTES" value="{{ config.THEATER_MIN_PROACTIVE_INTERVAL_MINUTES }}">
-                        <small>同一个人短时间内不被反复主动联系。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterContinuityInput">状态摘要刷新间隔 (回合数):</label>
-                        <input type="number" min="1" id="theaterContinuityInput" name="THEATER_CONTINUITY_REFRESH_TURNS" value="{{ config.THEATER_CONTINUITY_REFRESH_TURNS }}">
-                        <small>每多少回合刷新一次低频"当前状态摘要"，衔接长间隔的剧情。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterDecayInput">剧情余波自然衰减量 (每回合):</label>
-                        <input type="number" step="0.05" min="0" max="1" id="theaterDecayInput" name="THEATER_ACTIVE_CONSEQUENCE_DECAY" value="{{ config.THEATER_ACTIVE_CONSEQUENCE_DECAY }}">
-                        <small>短期剧情余波（如"还在生气"）随回合自然消退的速度。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterGroupReplyInput">剧场群聊回复概率 (%):</label>
-                        <input type="number" min="0" max="100" id="theaterGroupReplyInput" name="THEATER_GROUP_REPLY_PROBABILITY" value="{{ config.THEATER_GROUP_REPLY_PROBABILITY }}">
-                        <small>剧场模式的群聊：即使模型决定回复，也按此概率实际发送（群聊降噪）。</small>
+                        <small>存放 hdsi.sqlite3（与上游表结构一致）；旧版 *.json 会在首次打开记忆编辑器时归档到该目录的 _legacy_json_backup/。</small>
                     </div>
                     <div class="form-group">
                         <label for="theaterModelInput">剧场叙事模型:</label>
                         <input type="text" id="theaterModelInput" name="THEATER_MODEL" value="{{ config.THEATER_MODEL }}" placeholder="deepseek-chat">
-                        <small>剧场写作是纯文本/JSON，建议用稳定的文本模型（如 deepseek-chat），避免视觉模型偶发空内容；留空则用主模型。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterBubbleInput">主动冒泡间隔 (小时):</label>
-                        <input type="number" min="0" id="theaterBubbleInput" name="THEATER_BUBBLE_INTERVAL_HOURS" value="{{ config.THEATER_BUBBLE_INTERVAL_HOURS }}">
-                        <small>去掉随时主动联系，改为每隔多少小时在群里随口冒个泡（0=关闭）。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterLookbackInput">被@时回看最近消息条数:</label>
-                        <input type="number" min="1" id="theaterLookbackInput" name="THEATER_RECENT_LOOKBACK" value="{{ config.THEATER_RECENT_LOOKBACK }}">
-                        <small>剧场群被 @ 时，回看最近多少条群聊记录（含图片识图）作为上下文。</small>
+                        <small>建议用稳定的文本模型（如 deepseek-chat）；留空则用主模型 MODEL。</small>
                     </div>
 
-                    <h3 style="margin-top:24px; border-top:1px dashed #ddd; padding-top:16px;">HDS-Interlude 0.1.4 对齐项</h3>
-
+                    <h3 style="margin-top:18px;">② 节奏与推进</h3>
+                    <div class="form-group">
+                        <label for="theaterAdvanceInput">幕间推进间隔 (分钟):</label>
+                        <input type="number" min="5" id="theaterAdvanceInput" name="THEATER_ADVANCE_INTERVAL_MINUTES" value="{{ config.THEATER_ADVANCE_INTERVAL_MINUTES }}">
+                        <small>映射上游 runtime.autoAdvanceIntervalMinutes：没有消息时角色按真实时间生活。</small>
+                    </div>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>尊重安静时间（22:00-08:00）</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_RESPECT_QUIET_TIME" {% if config.THEATER_RESPECT_QUIET_TIME %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>映射上游 runtime.restWindows：安静时间内降低推进频率、不主动投递。</small>
+                    </div>
+                    <div class="form-group">
+                        <label>对话后续补写 (分钟):</label>
+                        <input type="number" min="1" name="THEATER_FOLLOWUP_MINUTES_1" value="{{ config.THEATER_FOLLOWUP_MINUTES_1 }}" style="width:90px;">
+                        <input type="number" min="1" name="THEATER_FOLLOWUP_MINUTES_2" value="{{ config.THEATER_FOLLOWUP_MINUTES_2 }}" style="width:90px;">
+                        <small>映射上游 runtime.conversationFollowUpMinutes（默认 10、20 分钟各补写一次对话余波）。</small>
+                    </div>
                     <div class="form-group">
                         <div class="switch-item">
                             <label>时间导演（Time Director）</label>
                             <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_TIME_DIRECTOR_ENABLED" {% if config.THEATER_TIME_DIRECTOR_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
                         </div>
-                        <small>自动推进/对话后续/到期意图前，先由轻量模型生成 1-4 个相对时间节拍（事件账本）并校验时间窗口，主叙事只渲染账本——防止越界推进或自我复读。</small>
-                    </div>
-                    <div class="form-group">
-                        <label>对话后续补写延迟 (分钟):</label>
-                        <div style="display:flex; gap:12px; align-items:center;">
-                            <span>第一次</span>
-                            <input type="number" min="1" style="width:80px;" name="THEATER_FOLLOWUP_MINUTES_1" value="{{ config.THEATER_FOLLOWUP_MINUTES_1 }}">
-                            <span>第二次</span>
-                            <input type="number" min="1" style="width:80px;" name="THEATER_FOLLOWUP_MINUTES_2" value="{{ config.THEATER_FOLLOWUP_MINUTES_2 }}">
-                        </div>
-                        <small>对话结束后约 N 分钟各补写一次"对话余波"，之后转入常规推进；太久不补写（默认 6 小时过期）。</small>
+                        <small>映射上游 timelineDirector.enabled：自动推进前先由轻量模型生成时间账本，失败自动降级。</small>
                     </div>
 
+                    <h3 style="margin-top:18px;">③ 叙事与记忆</h3>
                     <div class="form-group">
-                        <div class="switch-item">
-                            <label>Schedule Preplan（近期日程层）</label>
-                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PREPLAN_ENABLED" {% if config.THEATER_PREPLAN_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
-                        </div>
-                        <small>后台每日一次轻量日程审查，保存周规律 + 日期例外；主叙事只读取未来约 12 小时（最多八项，标记"计划非事实"）。</small>
+                        <label for="theaterBudgetInput">主叙事上下文条数:</label>
+                        <input type="number" min="5" id="theaterBudgetInput" name="THEATER_SCRIPT_BUDGET" value="{{ config.THEATER_SCRIPT_BUDGET }}">
+                        <small>映射上游 runtime.contextEntryLimit：每次写作读取的近期剧本条目下限。</small>
                     </div>
                     <div class="form-group">
-                        <label for="theaterPreplanHourInput">日程审查时间 (本地小时):</label>
-                        <input type="number" min="0" max="23" id="theaterPreplanHourInput" name="THEATER_PREPLAN_REVIEW_HOUR" value="{{ config.THEATER_PREPLAN_REVIEW_HOUR }}">
-                        <small>每天本地几点之后做日程审查（默认 8 点后第一个空闲机会）。</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="theaterPreplanGranInput">日程颗粒度:</label>
-                        <select id="theaterPreplanGranInput" name="THEATER_PREPLAN_GRANULARITY">
-                            <option value="stable" {% if config.THEATER_PREPLAN_GRANULARITY == 'stable' %}selected{% endif %}>stable（只接受稳定周规律如上课/作息）</option>
-                            <option value="contextual" {% if config.THEATER_PREPLAN_GRANULARITY == 'contextual' %}selected{% endif %}>contextual（允许学期/假期阶段与日期例外）</option>
-                            <option value="granular" {% if config.THEATER_PREPLAN_GRANULARITY == 'granular' %}selected{% endif %}>granular（额外允许少量 flexible 柔性候选）</option>
-                        </select>
-                        <small>颗粒度越大，越能保留更细的日程变化，但也更容易引入不稳定项。</small>
+                        <label for="theaterRecentContextInput">回复参考真实聊天条数:</label>
+                        <input type="number" min="1" id="theaterRecentContextInput" name="THEATER_RECENT_CONTEXT" value="{{ config.THEATER_RECENT_CONTEXT }}">
+                        <small>映射上游 memory.recentEntryLimit：主叙事读取的最近原始条目数。</small>
                     </div>
                     <div class="form-group">
                         <div class="switch-item">
-                            <label>自动推进锚点</label>
-                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PREPLAN_ANCHOR_ADVANCE" {% if config.THEATER_PREPLAN_ANCHOR_ADVANCE %}checked{% endif %}><span class="slider round"></span></label></div>
-                        </div>
-                        <small>未来 12 小时内 fixed 日程块（上课/补课/考试等）的开始/结束作为推进锚点，避免一次推进跨过到校/放学等关键节点。</small>
-                    </div>
-
-                    <div class="form-group">
-                        <div class="switch-item">
-                            <label>Agency Window 主动联系</label>
-                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PROACTIVE_ENABLED" {% if config.THEATER_PROACTIVE_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
-                        </div>
-                        <small>生活产生真实理由（事件/承诺/实际安排/关系后续）→ 检查日程/隐私/设备 → 立即联系 / 稍后重查 / 自然放下。默认关闭（保持"只冒泡不主动"）；开启后仅私聊剧场生效，群聊仍走冒泡。</small>
-                    </div>
-                    <div class="form-group">
-                        <div class="switch-item">
-                            <label>场景压缩</label>
+                            <label>场景压缩（长期记忆）</label>
                             <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_COMPACT_ENABLED" {% if config.THEATER_COMPACT_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
                         </div>
-                        <small>较旧剧本后台压缩成"前情摘要 + 在场表（最多 8 项）"，保留因果、承诺、大事件与关系变化，减少重复性叙述。</small>
+                        <small>映射上游 memory.enabled：旧剧本后台压缩成前情摘要 + 在场表，并沉淀长期事实。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterDecayInput">剧情余波默认强度 (0~1):</label>
+                        <input type="number" step="0.05" min="0" max="1" id="theaterDecayInput" name="THEATER_ACTIVE_CONSEQUENCE_DECAY" value="{{ config.THEATER_ACTIVE_CONSEQUENCE_DECAY }}">
+                        <small>映射上游 memory.activeConsequenceDefaultStrength：谈话/事件在之后几轮里的持续影响程度。</small>
                     </div>
 
+                    <h3 style="margin-top:18px;">④ 情绪（Alter）</h3>
                     <div class="form-group">
                         <div class="switch-item">
-                            <label>群聊意愿层（纯算法）</label>
+                            <label>启用情绪偏移追踪</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_ALTER_ENABLED" {% if config.THEATER_ALTER_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>映射上游 alterSystem.enabled：氛围净变化累计超过阈值后，生成临时情绪偏移注入后续写作。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterAlterThresholdInput">Alter 基础阈值:</label>
+                        <input type="number" min="1" max="50" id="theaterAlterThresholdInput" name="THEATER_ALTER_BASE_THRESHOLD" value="{{ config.THEATER_ALTER_BASE_THRESHOLD }}">
+                        <small>映射上游 alterSystem.baseThreshold。</small>
+                    </div>
+
+                    <h3 style="margin-top:18px;">⑤ 主动联系（Agency Window）</h3>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>启用主动联系裁决</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PROACTIVE_ENABLED" {% if config.THEATER_PROACTIVE_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>映射上游 agency.enabled + runtime.allowProactiveMessages：生活产生真实理由后，经日程/隐私/设备容量判断再决定立即联系、稍后重查或自然放下。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterProactiveInput">主动联系意愿阈值 (0-100):</label>
+                        <input type="number" min="0" max="100" id="theaterProactiveInput" name="THEATER_PROACTIVE_THRESHOLD" value="{{ config.THEATER_PROACTIVE_THRESHOLD }}">
+                        <small>映射上游 runtime.proactiveWillingnessThreshold（按 0-1 换算）。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterProactiveIntervalInput">两次主动联系最小间隔 (分钟):</label>
+                        <input type="number" min="0" id="theaterProactiveIntervalInput" name="THEATER_MIN_PROACTIVE_INTERVAL_MINUTES" value="{{ config.THEATER_MIN_PROACTIVE_INTERVAL_MINUTES }}">
+                        <small>映射上游 agency.minimumProactiveIntervalMinutes；承诺型联系可绕过。</small>
+                    </div>
+
+                    <h3 style="margin-top:18px;">⑥ 日程（Schedule Preplan）</h3>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>启用日程预判</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PREPLAN_ENABLED" {% if config.THEATER_PREPLAN_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>映射上游 schedulePreplan.enabled：后台每日审查周规律 + 日期例外，主叙事只读取未来约 12 小时。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterPreplanHourInput">每日审查起始小时 (0-23):</label>
+                        <input type="number" min="0" max="23" id="theaterPreplanHourInput" name="THEATER_PREPLAN_REVIEW_HOUR" value="{{ config.THEATER_PREPLAN_REVIEW_HOUR }}">
+                        <small>映射上游 schedulePreplan.reviewAfterLocalHour。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterPreplanGranularityInput">变化颗粒度:</label>
+                        <select id="theaterPreplanGranularityInput" name="THEATER_PREPLAN_GRANULARITY">
+                            <option value="stable" {% if config.THEATER_PREPLAN_GRANULARITY == 'stable' %}selected{% endif %}>stable（稳定周规律）</option>
+                            <option value="contextual" {% if config.THEATER_PREPLAN_GRANULARITY == 'contextual' %}selected{% endif %}>contextual（允许阶段/日期例外）</option>
+                            <option value="granular" {% if config.THEATER_PREPLAN_GRANULARITY == 'granular' %}selected{% endif %}>granular（额外允许柔性候选）</option>
+                        </select>
+                        <small>映射上游 schedulePreplan.variationLevel。</small>
+                    </div>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>日程锚点影响自动推进</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_PREPLAN_ANCHOR_ADVANCE" {% if config.THEATER_PREPLAN_ANCHOR_ADVANCE %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>映射上游 schedulePreplan.anchorAutoAdvance：上课/到校等固定日程边界可作为推进锚点。</small>
+                    </div>
+
+                    <h3 style="margin-top:18px;">⑦ 群聊</h3>
+                    <div class="form-group">
+                        <label for="theaterLookbackInput">群聊上下文回看条数:</label>
+                        <input type="number" min="4" max="100" id="theaterLookbackInput" name="THEATER_RECENT_LOOKBACK" value="{{ config.THEATER_RECENT_LOOKBACK }}">
+                        <small>映射上游 onebot.groupChats[].contextLimit：每次群叙事附带的最近群消息条数。</small>
+                    </div>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>群聊意愿层（纯算法门控）</label>
                             <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_GROUP_WILLINGNESS_ENABLED" {% if config.THEATER_GROUP_WILLINGNESS_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
                         </div>
-                        <small>未 @ 消息累积本地分数（边际递减 + 半衰期衰减），超过阈值按概率触发一次剧场写作；发言成功消耗意愿。@ 机器人始终直接处理，不走本层。</small>
+                        <small>映射上游 groupChats[].willingness（默认关闭）。关闭时所有群消息都进入群聊缓冲；开启后未@消息按本地分数决定是否调用主模型，@机器人始终直接通过。</small>
                     </div>
                     <div class="form-group">
                         <label for="theaterGroupWillThInput">群聊意愿触发阈值 (分数):</label>
-                        <input type="number" step="0.1" min="0.1" id="theaterGroupWillThInput" name="THEATER_GROUP_WILLINGNESS_THRESHOLD" value="{{ config.THEATER_GROUP_WILLINGNESS_THRESHOLD }}">
-                        <small>未 @ 的群消息累积分数超过该值后，按概率决定是否调用一次主模型。</small>
+                        <input type="number" step="0.01" min="0" max="1" id="theaterGroupWillThInput" name="THEATER_GROUP_WILLINGNESS_THRESHOLD" value="{{ config.THEATER_GROUP_WILLINGNESS_THRESHOLD }}">
+                        <small>映射上游 willingness.threshold（0-1）；大于 1 的旧值会被忽略并使用上游默认 0.24。</small>
                     </div>
                     <div class="form-group">
                         <label for="theaterGroupWillHlInput">群聊意愿半衰期 (分钟):</label>
                         <input type="number" min="1" id="theaterGroupWillHlInput" name="THEATER_GROUP_WILLINGNESS_HALF_LIFE_MINUTES" value="{{ config.THEATER_GROUP_WILLINGNESS_HALF_LIFE_MINUTES }}">
-                        <small>分数每过这段时间衰减一半，让短期热度自然回落。</small>
+                        <small>映射上游 willingness.decayHalfLifeSeconds。</small>
+                    </div>
+
+                    <div class="form-group" style="display:none;">
+                        <input type="hidden" name="THEATER_CONTINUITY_REFRESH_TURNS" value="{{ config.THEATER_CONTINUITY_REFRESH_TURNS }}">
+                        <input type="hidden" name="THEATER_GROUP_REPLY_PROBABILITY" value="{{ config.THEATER_GROUP_REPLY_PROBABILITY }}">
+                        <input type="hidden" name="THEATER_BUBBLE_INTERVAL_HOURS" value="{{ config.THEATER_BUBBLE_INTERVAL_HOURS }}">
                     </div>
                 </div>
 
                 <div id="section-theater-memory" class="content-panel">
-                    <h2>剧场记忆管理</h2>
+                    <h2>剧场记忆（HDS-Interlude）</h2>
                     <div class="form-group">
-                        <small>每个用户/群聊独立一部生活剧本。点击「编辑」可查看和修改该剧场的记忆分层：角色设定、世界观、舞台场景、剧情梗概、个体视角、剧情引子、长期事实、Overlay 渐进变化、参与者关系与剧情线。</small>
+                        <small>数据保存在 <code>Theater/hdsi.sqlite3</code>（13 张表，与上游 hds-interlude 的表结构一致）。
+                        旧版 <code>Theater/*.json</code> 记忆已下线：首次打开本页时会自动归档到
+                        <code>Theater/_legacy_json_backup/</code>，不再读写。</small>
                     </div>
-                    <div class="form-group" style="margin-top: 10px;">
-                        <div style="display:flex; align-items:center; gap:12px;">
+                    <div class="form-group" style="margin-top:10px;">
+                        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
                             <h3 style="margin:0;">剧场列表</h3>
-                            <button type="button" onclick="newTheater()" style="padding:4px 14px;">➕ 新建剧场</button>
+                            <button type="button" onclick="hdsiLoadStories()" style="padding:4px 14px;">🔄 刷新</button>
+                            <input type="text" id="hdsiStorySearch" placeholder="搜索角色 / 参与者…" style="padding:4px 8px; width:200px;" oninput="hdsiRenderStoryList()">
+                            <button type="button" onclick="hdsiNewStory()" style="padding:4px 14px;">➕ 手动新建（高级）</button>
                         </div>
-                        <ul class="theater-file-list" style="display: none;">
-                        </ul>
-                        <p class="no-theater-data" style="font-size: 14px; color: #777; display: block;">暂无剧场文件（角色和用户聊过天后会自动创建，也可以点「新建剧场」手动创建）。</p>
-                        <small>此处显示每个剧场（用户/群聊）的生活剧本文件；点「编辑」打开记忆编辑器。</small>
+                        <ul class="theater-file-list" id="hdsiStoryList" style="display:block; list-style:none; padding:0; margin:10px 0 0 0;"></ul>
+                        <p class="no-theater-data" id="hdsiNoStories" style="font-size:14px; color:#777; display:block;">暂无剧场数据：机器人与开启剧场的聊天对话后会自动创建。</p>
+                        <small>点「编辑」打开记忆编辑器：设定 / 演化层 / 剧本 / 参与者 / 场景 / 记忆 / 长期事实 / 意图 / 状态 / 日程 / 运行信息。</small>
                     </div>
                 </div>
 
@@ -5486,276 +5739,299 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
         </div>
     </div>
 
-    <!-- 剧场记忆编辑弹窗：分层 Tabbed UI（参考 HDS-Interlude 记忆分层） -->
+    <!-- 剧场记忆编辑弹窗：HDS-Interlude（hdsi.sqlite3）-->
     <div id="editTheaterMemoryModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(20,28,24,0.45); backdrop-filter:blur(2px); z-index:2100;">
         <div style="background:#fff; width:96%; max-width:1280px; margin:1.5vh auto; padding:0 22px 14px 22px; border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,0.28); position:relative; max-height:94vh; overflow-y:auto; border-top:4px solid #43a047;">
-            <button type="button" class="tm-close" onclick="closeEditTheaterMemoryModal()" title="关闭">×</button>
-            <h3 style="margin:14px 0 6px 0; font-size:19px; color:#2e3a33; font-weight:700;">🎭 编辑剧场记忆</h3>
+            <button type="button" class="tm-close" onclick="hdsiCloseStory()" title="关闭">×</button>
+            <h3 style="margin:14px 0 6px 0; font-size:19px; color:#2e3a33; font-weight:700;">🎭 编辑剧场记忆（HDS-Interlude）</h3>
             <div style="margin-bottom:12px; color:#555; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
-                <span class="tm-title-chip">剧场：<span id="editTheaterMemoryName" style="font-weight:bold;"></span></span>
-                <span id="tmStat" class="tm-stat"></span>
+                <span class="tm-title-chip">剧场：<span id="hdsiTitleName" style="font-weight:bold;"></span></span>
+                <span id="hdsiStat" class="tm-stat"></span>
+                <span id="hdsiStatus" style="font-size:12px; color:#2e7d32;"></span>
             </div>
 
-            <!-- Tab 导航 -->
-            <div class="tm-tabs" id="tmTabs">
+            <div class="tm-tabs" id="hdsiTabs">
                 <button type="button" class="tm-tab-btn active" data-tab="canon">设定</button>
-                <button type="button" class="tm-tab-btn" data-tab="timeline">时间线</button>
-                <button type="button" class="tm-tab-btn" data-tab="memory">记忆</button>
-                <button type="button" class="tm-tab-btn" data-tab="overlay">Overlay</button>
+                <button type="button" class="tm-tab-btn" data-tab="overlay">演化层</button>
+                <button type="button" class="tm-tab-btn" data-tab="script">剧本</button>
                 <button type="button" class="tm-tab-btn" data-tab="participants">参与者</button>
-                <button type="button" class="tm-tab-btn" data-tab="status">状态</button>
+                <button type="button" class="tm-tab-btn" data-tab="scenes">场景</button>
+                <button type="button" class="tm-tab-btn" data-tab="memories">记忆</button>
+                <button type="button" class="tm-tab-btn" data-tab="facts">长期事实</button>
                 <button type="button" class="tm-tab-btn" data-tab="intents">意图</button>
-                <button type="button" class="tm-tab-btn" data-tab="summary">前情摘要</button>
-                <button type="button" class="tm-tab-btn" data-tab="presence">在场表</button>
+                <button type="button" class="tm-tab-btn" data-tab="state">状态</button>
                 <button type="button" class="tm-tab-btn" data-tab="preplan">日程</button>
-                <button type="button" class="tm-tab-btn" data-tab="runtime">运行</button>
+                <button type="button" class="tm-tab-btn" data-tab="runtime">运行信息</button>
             </div>
 
-            <!-- 1. Canon / 设定 -->
+            <!-- 1. 设定 -->
             <div class="tm-panel" id="tm-panel-canon">
-                <div class="form-group">
-                    <label>角色设定 (Canon)：角色的初始人设、性格、语言风格</label>
-                    <textarea id="tmCharacter" rows="5" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>世界观 / 舞台：时代、地点、背景设定</label>
-                    <textarea id="tmWorld" rows="3" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>当前舞台场景：当前正在发生的舞台位置</label>
-                    <input type="text" id="tmScene" style="width:100%;">
-                </div>
-                <div class="form-group">
-                    <label>剧情梗概 / 初始信息：开场设定、人物处境</label>
-                    <textarea id="tmBrief" rows="3" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>角色个体视角（Perspective）：独立于 Canon 的看待世界/他人/自己的方式</label>
-                    <textarea id="tmPerspective" rows="2" style="width:100%;"></textarea>
-                </div>
-                <small style="color:#888;">Canon 是剧情起点。小修改可直接保留；若大幅修改角色身份/核心性格/世界规则/某位参与者初始关系，建议保存后到「Overlay」标签清除对应演化层。</small>
+                <div class="form-group"><label>角色名</label><input type="text" id="hdsiCharName" style="width:100%;"></div>
+                <div class="form-group"><label>角色档案（Canon：性格、日程、说话方式）</label><textarea id="hdsiCharProfile" rows="5" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>用户显示名</label><input type="text" id="hdsiUserName" style="width:100%;"></div>
+                <div class="form-group"><label>用户资料</label><textarea id="hdsiUserProfile" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>初始关系</label><textarea id="hdsiRelationship" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>世界观</label><textarea id="hdsiWorld" rows="3" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>视角 Perspective（主角稳定的价值观/看世界方式）</label><textarea id="hdsiPerspective" rows="3" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>配角</label><textarea id="hdsiSupportingCast" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>主要活动地点</label><input type="text" id="hdsiLocation" style="width:100%;"></div>
+                <div class="form-group"><label>叙事文风</label><textarea id="hdsiStyle" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>时区（IANA，如 Asia/Shanghai）</label><input type="text" id="hdsiTimezone" style="width:100%;"></div>
+                <div class="form-group"><button type="button" class="tm-mini-btn" onclick="hdsiSaveCanon()">保存设定</button></div>
             </div>
 
-            <!-- 2. Timeline / 时间线（只读） -->
-            <div class="tm-panel" id="tm-panel-timeline" style="display:none;">
-                <div class="form-group" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                    <span id="tmTimelineCount" style="font-weight:bold; color:#333;">剧本条目：加载中…</span>
-                    <div style="display:flex; gap:8px;">
-                        <button type="button" class="tm-mini-btn" onclick="tmLoadTimeline(true)">刷新</button>
-                        <button type="button" class="tm-mini-btn" onclick="tmLoadMoreScript()">加载更多</button>
-                        <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearScript()">清空剧本</button>
-                    </div>
-                </div>
-                <div id="tmTimelineList" class="tm-script-list">（点「刷新」加载）</div>
-            </div>
-
-            <!-- 3. Memory / 记忆 -->
-            <div class="tm-panel" id="tm-panel-memory" style="display:none;">
-                <div class="form-group">
-                    <label>剧情引子 / 近期事实（每行一条）：正在处理的事、最近生活细节、关系余波和下一步线索</label>
-                    <textarea id="tmThreads" rows="5" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>长期事实（每行一条）：承诺、重要事件、稳定世界事实和未解决事项</label>
-                    <textarea id="tmLongTerm" rows="6" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>未兑现承诺（来自「意图」标签，只读）</label>
-                    <div id="tmPendingPromises" class="tm-readonly-list">（无）</div>
-                </div>
-            </div>
-
-            <!-- 4. Overlay / 渐进变化 -->
+            <!-- 2. 演化层 -->
             <div class="tm-panel" id="tm-panel-overlay" style="display:none;">
-                <div class="form-group">
-                    <label>Overlay 渐进变化（每行：层|目标|描述）</label>
-                    <textarea id="tmOverlays" rows="8" style="width:100%; font-family:monospace;"></textarea>
-                    <small style="color:#888;">层 ∈ character | world | relationship；目标可空。例：<code>relationship|对方|逐渐熟络</code>。一次只记长期稳定变化，1-2 条；不要把单次情绪写进 Overlay。</small>
+                <small style="color:#777;">由后台压缩器沉淀的渐进演化（Overlay）；手动修改会直接写回 story.state.settingOverlay。</small>
+                <div class="form-group"><label>角色档案演化</label><textarea id="hdsiOverlayCharacter" rows="3" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>视角演化</label><textarea id="hdsiOverlayPerspective" rows="3" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>关系演化</label><textarea id="hdsiOverlayRelationship" rows="3" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>世界演化</label><textarea id="hdsiOverlayWorld" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>配角演化</label><textarea id="hdsiOverlayCast" rows="2" style="width:100%;"></textarea></div>
+                <div class="form-group"><label>地点演化</label><input type="text" id="hdsiOverlayLocation" style="width:100%;"></div>
+                <div class="form-group"><label>性格变化条目（每行一条）</label><textarea id="hdsiOverlayTraits" rows="5" style="width:100%;"></textarea></div>
+                <div class="form-group" style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn" onclick="hdsiSaveOverlay()">保存演化层</button>
+                    <button type="button" class="tm-mini-btn tm-danger" onclick="hdsiClearOverlay()">清空整个演化层</button>
                 </div>
-                <div class="form-group">
-                    <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearOverlayLayer('character')">清除 character 层</button>
-                    <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearOverlayLayer('world')">清除 world 层</button>
-                    <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearOverlayLayer('relationship')">清除 relationship 层</button>
-                    <small style="color:#888;">修改 Canon 后可按需清除对应演化层；保留其余剧本与记忆。</small>
-                </div>
+                <div class="form-group"><label>历史压缩快照（只读）</label><div id="hdsiOverlaySnapshots" class="tm-readonly-list">（无）</div></div>
             </div>
 
-            <!-- 5. Participants / 参与者 -->
+            <!-- 3. 剧本 -->
+            <div class="tm-panel" id="tm-panel-script" style="display:none;">
+                <div class="form-group" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <span id="hdsiScriptCount" style="font-weight:bold; color:#333;">剧本条目：加载中…</span>
+                    <select id="hdsiScriptKind" onchange="hdsiLoadScript(true)" style="padding:3px;">
+                        <option value="">全部类型</option>
+                        <option value="script">script（叙事正文）</option>
+                        <option value="user-message">user-message</option>
+                        <option value="character-message">character-message</option>
+                        <option value="group-message">group-message</option>
+                        <option value="character-group-message">character-group-message</option>
+                        <option value="setup">setup</option>
+                        <option value="participant-joined">participant-joined</option>
+                        <option value="memory">memory</option>
+                        <option value="system">system</option>
+                    </select>
+                    <button type="button" class="tm-mini-btn" onclick="hdsiLoadScript(true)">刷新</button>
+                    <button type="button" class="tm-mini-btn tm-danger" onclick="hdsiClearScript()">清空全部剧本</button>
+                </div>
+                <div id="hdsiScriptList" class="tm-script-list">（点「刷新」加载）</div>
+                <div class="form-group"><button type="button" class="tm-mini-btn" id="hdsiScriptMore" onclick="hdsiLoadScript(false)">加载更多</button></div>
+            </div>
+
+            <!-- 4. 参与者 -->
             <div class="tm-panel" id="tm-panel-participants" style="display:none;">
+                <small style="color:#777;">参与者 = 与主角建立关系分支的账号；这里可修正称呼/背景/关系备注与关系演化。</small>
+                <div id="hdsiParticipantList"></div>
+            </div>
+
+            <!-- 5. 场景 -->
+            <div class="tm-panel" id="tm-panel-scenes" style="display:none;">
                 <div class="form-group">
-                    <label>参与者（每行：名字|资料|初始关系|关系演化|剧情线/待办）</label>
-                    <textarea id="tmParticipants" rows="7" style="width:100%; font-family:monospace;"></textarea>
-                    <small style="color:#888;">每位参与者保留独立的资料、初始关系、关系演化与剧情线。空字段可用竖线占位，例如：<code>小张|公司同事||熟络了|欠他一顿饭</code>。</small>
+                    <label>活跃场景（可修正引子/摘要）</label>
+                    <select id="hdsiSceneSelect" onchange="hdsiFillSceneForm()" style="width:100%;"></select>
+                    <textarea id="hdsiSceneHook" rows="2" style="width:100%; margin-top:6px;" placeholder="场景引子 hook"></textarea>
+                    <textarea id="hdsiSceneSummary" rows="4" style="width:100%; margin-top:6px;" placeholder="场景摘要 summary"></textarea>
+                    <button type="button" class="tm-mini-btn" style="margin-top:6px;" onclick="hdsiSaveScene()">保存场景</button>
+                </div>
+                <div class="form-group">
+                    <label>剧情弧线（可修正标题/摘要）</label>
+                    <select id="hdsiArcSelect" onchange="hdsiFillArcForm()" style="width:100%;"></select>
+                    <input type="text" id="hdsiArcTitle" style="width:100%; margin-top:6px;" placeholder="弧线标题">
+                    <textarea id="hdsiArcSummary" rows="3" style="width:100%; margin-top:6px;" placeholder="弧线摘要"></textarea>
+                    <button type="button" class="tm-mini-btn" style="margin-top:6px;" onclick="hdsiSaveArc()">保存弧线</button>
+                </div>
+                <div class="form-group"><label>场景历史（只读，最近 30）</label><div id="hdsiSceneHistory" class="tm-readonly-list">（无）</div></div>
+            </div>
+
+            <!-- 6. 记忆 -->
+            <div class="tm-panel" id="tm-panel-memories" style="display:none;">
+                <div class="form-group" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn" onclick="hdsiLoadMemories()">刷新</button>
+                    <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiClearArchivedMemories()">清空已归档</button>
+                </div>
+                <div id="hdsiMemoryList" class="tm-script-list"></div>
+                <div class="form-group" style="border-top:1px dashed #ccc; padding-top:10px;">
+                    <label>新增记忆</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                        <input type="text" id="hdsiMemCategory" placeholder="category（event/relationship…）" style="width:220px;">
+                        <input type="number" id="hdsiMemImportance" value="0.5" step="0.05" min="0" max="1" style="width:80px;">
+                        <select id="hdsiMemParticipant" style="width:180px;"></select>
+                        <input type="text" id="hdsiMemContent" placeholder="记忆内容" style="flex:1; min-width:240px;">
+                        <button type="button" class="tm-mini-btn" onclick="hdsiAddMemory()">添加</button>
+                    </div>
                 </div>
             </div>
 
-            <!-- 6. Status / 状态 -->
-            <div class="tm-panel" id="tm-panel-status" style="display:none;">
-                <h4 style="margin:0 0 8px 0; color:#388e3c;">低频状态摘要（Continuity）</h4>
-                <div class="form-group">
-                    <label>当前状态（current，一句话）</label>
-                    <input type="text" id="tmContinuityCurrent" style="width:100%;">
+            <!-- 7. 长期事实 -->
+            <div class="tm-panel" id="tm-panel-facts" style="display:none;">
+                <div class="form-group" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn" onclick="hdsiLoadFacts()">刷新</button>
+                    <label style="font-weight:normal;"><input type="checkbox" id="hdsiFactShowArchived" onchange="hdsiRenderFacts()"> 显示已遗忘</label>
                 </div>
-                <div class="form-group">
-                    <label>下一步（next，每行一条，1-3 条）</label>
-                    <textarea id="tmContinuityNext" rows="2" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>近期事实（recent，每行一条，1-4 条）</label>
-                    <textarea id="tmContinuityRecent" rows="2" style="width:100%;"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>重要事项（salient，每行一条，1-3 条）</label>
-                    <textarea id="tmContinuitySalient" rows="2" style="width:100%;"></textarea>
-                </div>
-
-                <h4 style="margin:14px 0 8px 0; color:#388e3c;">剧情余波（activeConsequence，每行：effect|strength(0-1)|minutes）</h4>
-                <div class="form-group">
-                    <textarea id="tmConsequences" rows="4" style="width:100%; font-family:monospace;" placeholder="例：还在为刚才的争执心烦|0.7|30"></textarea>
-                    <small style="color:#888;">minutes = 大概还会持续多少分钟；写作时每回合按 THEATER_ACTIVE_CONSEQUENCE_DECAY 自然衰减。</small>
-                </div>
-
-                <h4 style="margin:14px 0 8px 0; color:#388e3c;">Alter 氛围惯性（mood）</h4>
-                <div class="form-group" style="display:flex; flex-wrap:wrap; gap:14px;">
-                    <div><label>累计净变化（cumulative）</label><input type="number" step="1" id="tmMoodCumulative" style="width:90px;"></div>
-                    <div><label>权重（0-1）</label><input type="number" step="0.05" min="0" max="1" id="tmMoodWeight" style="width:90px;"></div>
-                    <div><label>方向</label>
-                        <select id="tmMoodDirection" style="width:130px;">
-                            <option value="">（无）</option>
-                            <option value="1">严肃/紧张/正式</option>
-                            <option value="-1">轻松/随意/活跃</option>
+                <div id="hdsiFactList" class="tm-script-list"></div>
+                <div class="form-group" style="border-top:1px dashed #ccc; padding-top:10px;">
+                    <label>新增长期事实</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                        <select id="hdsiFactScope" style="width:130px;">
+                            <option value="event">event</option>
+                            <option value="promise">promise</option>
+                            <option value="relationship">relationship</option>
+                            <option value="character">character</option>
+                            <option value="world">world</option>
                         </select>
+                        <input type="number" id="hdsiFactImportance" value="0.5" step="0.05" min="0" max="1" style="width:80px;" title="importance">
+                        <input type="number" id="hdsiFactConfidence" value="0.8" step="0.05" min="0" max="1" style="width:80px;" title="confidence">
+                        <label style="font-weight:normal;"><input type="checkbox" id="hdsiFactUnresolved"> 未解决</label>
+                        <select id="hdsiFactParticipant" style="width:170px;"></select>
+                        <input type="text" id="hdsiFactContent" placeholder="事实内容" style="flex:1; min-width:240px;">
+                        <button type="button" class="tm-mini-btn" onclick="hdsiAddFact()">添加</button>
                     </div>
-                    <div style="flex:1; min-width:220px;"><label>情绪偏移描述</label><input type="text" id="tmMoodDescription" style="width:100%;"></div>
-                </div>
-
-                <h4 style="margin:14px 0 8px 0; color:#388e3c;">行动条件（Agency Window）</h4>
-                <div class="form-group" style="display:flex; flex-wrap:wrap; gap:14px;">
-                    <div><label>日程负荷</label>
-                        <select id="tmAgencyLoad" style="width:130px;">
-                            <option value="free">空闲</option>
-                            <option value="occupied">忙碌</option>
-                            <option value="overloaded">过载</option>
-                        </select>
-                    </div>
-                    <div><label>隐私</label>
-                        <select id="tmAgencyPrivacy" style="width:130px;">
-                            <option value="private">私密空间</option>
-                            <option value="shared">共享场合</option>
-                            <option value="public">公共场合</option>
-                        </select>
-                    </div>
-                    <div><label>设备</label>
-                        <select id="tmAgencyDevice" style="width:130px;">
-                            <option value="available">设备可用</option>
-                            <option value="limited">设备受限</option>
-                            <option value="unavailable">设备不可用</option>
-                        </select>
-                    </div>
-                    <div><label>有效时长（分钟）</label><input type="number" min="15" max="1440" id="tmAgencyMinutes" style="width:90px;" value="120"></div>
-                    <div style="flex:1; min-width:240px;"><label>依据（basis，引用本轮真实剧情）</label><input type="text" id="tmAgencyBasis" style="width:100%;"></div>
                 </div>
             </div>
 
-            <!-- 7. Intents / 意图 -->
+            <!-- 8. 意图 -->
             <div class="tm-panel" id="tm-panel-intents" style="display:none;">
-                <div class="form-group" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                    <span id="tmIntentsCount" style="font-weight:bold;">待办意图：加载中…</span>
-                    <button type="button" class="tm-mini-btn tm-warn" onclick="clearTheaterDoneIntents()">清理已完成意图</button>
+                <div class="form-group" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn" onclick="hdsiLoadIntents()">刷新</button>
+                    <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiClearDoneIntents()">清除已完成/已取消</button>
                 </div>
-                <div id="tmIntentsList" class="tm-script-list">（点「刷新」加载）</div>
-
-                <h4 style="margin:14px 0 8px 0; color:#388e3c;">新增意图</h4>
-                <div class="form-group" style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end;">
-                    <div><label>类型</label>
-                        <select id="tmNewIntentType" style="width:140px;">
-                            <option value="reminder">提醒 reminder</option>
-                            <option value="delayed_reply">延迟回复 delayed_reply</option>
-                            <option value="followup">对话后续 followup</option>
-                            <option value="promise">承诺 promise</option>
+                <div id="hdsiIntentList" class="tm-script-list"></div>
+                <div class="form-group" style="border-top:1px dashed #ccc; padding-top:10px;">
+                    <label>新增意图（到期后由引擎重新裁决）</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                        <select id="hdsiIntentType" style="width:210px;">
+                            <option value="delayed-reply">delayed-reply（延迟回复）</option>
+                            <option value="reminder">reminder（提醒）</option>
+                            <option value="followup">followup（对话后续）</option>
+                            <option value="promise">promise（承诺回访）</option>
+                            <option value="proactive-check">proactive-check（主动联系重查）</option>
+                            <option value="active-consequence">active-consequence（剧情余波）</option>
                         </select>
+                        <input type="number" id="hdsiIntentMinutes" value="30" min="1" style="width:90px;" title="多少分钟后到期">
+                        <select id="hdsiIntentParticipant" style="width:170px;"></select>
+                        <input type="text" id="hdsiIntentSummary" placeholder="意图内容/摘要" style="flex:1; min-width:240px;">
+                        <button type="button" class="tm-mini-btn" onclick="hdsiAddIntent()">添加</button>
                     </div>
-                    <div><label>目标参与者</label><input type="text" id="tmNewIntentTarget" style="width:160px;" placeholder="昵称或留空"></div>
-                    <div><label>延迟（分钟）</label><input type="number" min="1" id="tmNewIntentWhen" style="width:90px;" value="30"></div>
-                    <div style="flex:1; min-width:240px;"><label>内容</label><input type="text" id="tmNewIntentContent" style="width:100%;"></div>
-                    <button type="button" class="tm-mini-btn" onclick="tmAddIntent()">添加</button>
                 </div>
             </div>
 
-            <!-- 8. 前情摘要 -->
-            <div class="tm-panel" id="tm-panel-summary" style="display:none;">
-                <div class="tm-toolbar">
-                    <span id="tmSummaryCount" class="tm-count">前情摘要：加载中…</span>
-                    <span class="tm-toolbar-actions">
-                        <button type="button" class="tm-mini-btn" onclick="tmSaveSummary()">保存摘要</button>
-                        <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearStorySummary()">清空摘要</button>
-                    </span>
+            <!-- 9. 状态 -->
+            <div class="tm-panel" id="tm-panel-state" style="display:none;">
+                <div class="form-group">
+                    <label>当前状态摘要（continuity）</label>
+                    <input type="text" id="hdsiContinuityCurrent" style="width:100%;" placeholder="current：一句话现状">
+                    <textarea id="hdsiContinuityRecent" rows="2" style="width:100%; margin-top:6px;" placeholder="recent：最近发生的事（每行一条）"></textarea>
+                    <textarea id="hdsiContinuitySalient" rows="2" style="width:100%; margin-top:6px;" placeholder="salient：当前最要紧的事（每行一条）"></textarea>
+                    <small style="color:#999;">上游不持久化 continuity.next（未来事项由意图/日程承载），此处不提供编辑。</small>
+                    <div style="margin-top:6px;"><button type="button" class="tm-mini-btn" onclick="hdsiSaveContinuity()">保存摘要</button></div>
                 </div>
                 <div class="form-group">
-                    <label>编辑摘要（每行一条，最旧在前；保存后立即生效）</label>
-                    <textarea id="tmSummaryText" rows="8" style="width:100%; font-family:monospace;" placeholder="例：小美近期忙着备考，和室友因为小事闹了点别扭又和好。"></textarea>
-                    <small class="tm-hint">这些是后台把较旧剧本压缩出来的概要，会作为背景喂给模型。可增删改文字；改完点「保存摘要」。</small>
-                </div>
-                <div id="tmSummaryList" class="tm-script-list tm-summary-list">（点「刷新」加载）</div>
-            </div>
-
-            <!-- 9. 在场表 -->
-            <div class="tm-panel" id="tm-panel-presence" style="display:none;">
-                <div class="tm-toolbar">
-                    <span class="tm-count">在场表</span>
-                    <span class="tm-toolbar-actions">
-                        <button type="button" class="tm-mini-btn" onclick="saveTheaterMemory()">保存在场表</button>
-                    </span>
+                    <label>推进时钟（automation，只读）</label>
+                    <div id="hdsiAutomationInfo" class="tm-readonly-list">（加载中…）</div>
+                    <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+                        <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiResetAdvance()">让它下一轮立即推进</button>
+                        <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiResetAutomation()">清空推进时钟</button>
+                    </div>
                 </div>
                 <div class="form-group">
-                    <label>在场表（每行：名字|状态|备注）</label>
-                    <textarea id="tmPresence" rows="6" style="width:100%; font-family:monospace;" placeholder="例：店长|left|下班了"></textarea>
-                    <small class="tm-hint">状态 ∈ present | left | joining；最多 8 项。压缩剧本时按真实条目确认。</small>
+                    <label>情绪偏移（Alter）</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                        <input type="number" id="hdsiAlterValue" step="1" min="-5" max="5" style="width:80px;" title="alterValue">
+                        <input type="number" id="hdsiAlterWeight" step="0.05" min="0" max="1" style="width:80px;" title="alterWeight">
+                        <select id="hdsiAlterDirection" style="width:120px;"><option value="serious">serious</option><option value="relaxed">relaxed</option></select>
+                        <input type="number" id="hdsiAlterIntensity" step="0.1" min="1" max="3" style="width:80px;" title="intensity">
+                        <input type="text" id="hdsiAlterDescription" placeholder="情绪偏移描述" style="flex:1; min-width:240px;">
+                    </div>
+                    <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+                        <button type="button" class="tm-mini-btn" onclick="hdsiSaveAlter()">保存情绪</button>
+                        <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiClearAlter()">清空情绪偏移</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>行动窗口（Agency Window）</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+                        <select id="hdsiAgencyLoad" style="width:130px;"><option value="free">free</option><option value="occupied">occupied</option><option value="overloaded">overloaded</option></select>
+                        <select id="hdsiAgencyPrivacy" style="width:120px;"><option value="private">private</option><option value="shared">shared</option><option value="public">public</option></select>
+                        <select id="hdsiAgencyDevice" style="width:140px;"><option value="available">available</option><option value="limited">limited</option><option value="unavailable">unavailable</option></select>
+                        <input type="number" id="hdsiAgencyMinutes" value="240" min="5" max="1440" style="width:90px;" title="有效分钟">
+                        <input type="text" id="hdsiAgencyBasis" placeholder="依据（引用真实生活）" style="flex:1; min-width:220px;">
+                    </div>
+                    <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+                        <button type="button" class="tm-mini-btn" onclick="hdsiSaveAgency()">保存行动窗口</button>
+                        <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiClearAgency()">清空行动窗口</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>在场表（只读，压缩器维护）</label>
+                    <div id="hdsiPresenceInfo" class="tm-readonly-list">（无）</div>
+                    <div style="margin-top:6px;"><button type="button" class="tm-mini-btn tm-warn" onclick="hdsiClearPresence()">清空在场表</button></div>
+                </div>
+                <div class="form-group">
+                    <label>手头小事 workingDetails（每行：label|value|expiresAt(可选)）</label>
+                    <textarea id="hdsiWorkingDetails" rows="3" style="width:100%; font-family:monospace;"></textarea>
+                    <button type="button" class="tm-mini-btn" style="margin-top:6px;" onclick="hdsiSaveWorkingDetails()">保存手头小事</button>
+                </div>
+                <div class="form-group">
+                    <label>未决线索 timelineCarry（每行一条，最多 4 条）</label>
+                    <textarea id="hdsiTimelineCarry" rows="2" style="width:100%;"></textarea>
+                    <button type="button" class="tm-mini-btn" style="margin-top:6px;" onclick="hdsiSaveTimelineCarry()">保存未决线索</button>
+                </div>
+                <div class="form-group">
+                    <label>自动投递摘要（只读）</label>
+                    <div id="hdsiDeliverySummaries" class="tm-readonly-list">（无）</div>
                 </div>
             </div>
 
-            <!-- 10. 日程 Preplan -->
+            <!-- 10. 日程 -->
             <div class="tm-panel" id="tm-panel-preplan" style="display:none;">
+                <div id="hdsiPreplanInfo" class="tm-readonly-list">（加载中…）</div>
                 <div class="form-group">
-                    <span id="tmPreplanInfo" style="color:#555;">日程审查信息：加载中…</span>
+                    <label>周规律 regimes（JSON 数组，高级）</label>
+                    <textarea id="hdsiPreplanRegimes" rows="8" style="width:100%; font-family:monospace;"></textarea>
                 </div>
-                <h4 style="margin:8px 0 6px 0; color:#388e3c;">周规律（regimes）</h4>
-                <div id="tmRegimesList"></div>
-                <button type="button" class="tm-mini-btn" onclick="tmAddRegime()">+ 添加周规律</button>
-
-                <h4 style="margin:14px 0 6px 0; color:#388e3c;">日期例外（exceptions，需要 contextual / granular 颗粒度）</h4>
-                <div id="tmExceptionsList"></div>
-                <button type="button" class="tm-mini-btn" onclick="tmAddException()">+ 添加日期例外</button>
-
-                <div class="form-group" style="margin-top:14px;">
-                    <button type="button" class="tm-mini-btn tm-danger" onclick="tmClearPreplan()">清空日程</button>
-                    <small style="color:#888;">清空后下次后台空闲时仍会重新审查；这里只是手动重置。</small>
+                <div class="form-group">
+                    <label>日期例外 exceptions（JSON 数组，高级）</label>
+                    <textarea id="hdsiPreplanExceptions" rows="5" style="width:100%; font-family:monospace;"></textarea>
+                </div>
+                <div class="form-group" style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn" onclick="hdsiSavePreplanJson()">保存日程 JSON</button>
+                    <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiRebuildPreplan()">请求后台重新审查</button>
+                    <button type="button" class="tm-mini-btn tm-danger" onclick="hdsiClearPreplan()">清空日程</button>
                 </div>
             </div>
 
-            <!-- 11. Runtime / 运行元数据 -->
+            <!-- 11. 运行信息 -->
             <div class="tm-panel" id="tm-panel-runtime" style="display:none;">
-                <div id="tmRuntimeInfo" class="tm-readonly-list">（加载中…）</div>
-                <div class="form-group" style="margin-top:12px; display:flex; flex-wrap:wrap; gap:10px;">
-                    <button type="button" class="tm-mini-btn tm-warn" onclick="tmResetAdvance()">重置推进时间</button>
-                    <button type="button" class="tm-mini-btn tm-warn" onclick="tmResetAllTimestamps()">重置所有时间戳</button>
-                    <button type="button" class="tm-mini-btn tm-danger" onclick="tmExportJSON()">导出整个剧场 JSON</button>
+                <div id="hdsiRuntimeInfo" class="tm-readonly-list">（加载中…）</div>
+                <div class="form-group">
+                    <label>设定补丁（state patches）</label>
+                    <div id="hdsiPatchList" class="tm-script-list"></div>
                 </div>
-                <small style="color:#888;">"重置推进时间"会把 last_advance 置 0，下一轮幕间推进线程立即触发；"重置所有时间戳"还会清零 followup_done、turns_since_refresh 等。</small>
+                <div class="form-group">
+                    <label>场景帧 / 对话簇（只读调试）</label>
+                    <div id="hdsiFrameInfo" class="tm-readonly-list">（无）</div>
+                </div>
+                <div class="form-group" style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <button type="button" class="tm-mini-btn tm-warn" onclick="hdsiResetRuntimeAll()">重置运行状态（推进/情绪/行动）</button>
+                    <button type="button" class="tm-mini-btn" onclick="hdsiExportStory()">导出整个剧场 JSON</button>
+                    <button type="button" class="tm-mini-btn tm-danger" onclick="hdsiDeleteStory()">删除这个剧场</button>
+                </div>
             </div>
 
             <!-- Footer -->
             <div style="margin-top:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                <div id="tmAutoSaved" style="color:#888; font-size:12px;"></div>
+                <div id="hdsiAutoSaved" style="color:#888; font-size:12px;"></div>
                 <div style="display:flex; gap:10px;">
-                    <button type="button" class="nav-button" style="background:#4caf50; color:#fff;" onclick="saveTheaterMemory()">保存</button>
-                    <button type="button" class="nav-button" style="background:#607d8b; color:#fff; cursor:pointer;" onclick="closeEditTheaterMemoryModal()">取消</button>
+                    <button type="button" class="nav-button" style="background:#4caf50; color:#fff;" onclick="hdsiSaveAll()">保存设定/演化/状态</button>
+                    <button type="button" class="nav-button" style="background:#607d8b; color:#fff;" onclick="hdsiCloseStory()">关闭</button>
                 </div>
             </div>
-            <div id="editTheaterMemoryError" style="color:#f44336; margin-top:8px; display:none;"></div>
+            <div id="hdsiError" style="color:#f44336; margin-top:8px; display:none;"></div>
         </div>
     </div>
-    <style>
+<style>
     /* ===== 剧场记忆编辑器样式（美化版）===== */
     .tm-tabs {
         display: flex;

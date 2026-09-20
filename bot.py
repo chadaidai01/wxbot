@@ -12,6 +12,7 @@
 
 import sys
 import base64
+import hashlib
 import requests
 import logging
 from datetime import datetime
@@ -39,8 +40,8 @@ os.environ["PROJECT_NAME"] = 'iwyxdxl/WeChatBot_WXAUTO_SE'
 # 本地数据监听 (UserDataIsSafeFromUsers HTTP API)
 from localdb_listener import LocalDbListener, LocalDbChat
 
-# 剧场系统（参考 HDS-Interlude：角色作为演员维护持续生活剧本）
-from theater import Theater
+# 剧场系统：整个引擎已一比一移植为 hdsi/ 包（HDS-Interlude 1.0.1-beta6-rebuild），
+# 具体接线见下方 _get_hdsi_runtime / _hdsi_handle_incoming。
 
 # ---- wxauto 仅用于发送：懒加载，初始化失败不阻塞 bot 运行 ----
 _wx = None
@@ -598,22 +599,33 @@ def _voice_call(who):
         return False
 
 
-# ---- 剧场系统 (Theater)：角色作为"演员"维护持续生活剧本 ----
-theaters = {}               # 聊天名 -> Theater
-theaters_lock = threading.Lock()
-# 记录各聊天正在"打字发送中"的文本片段（被打断即作为未说完的草稿交给剧场）
+# ---- 剧场系统（HDS-Interlude 移植版 hdsi/）：角色作为"演员"维护持续生活剧本 ----
+# 上游：https://gitee.com/MomoiCore/hds-interlude （Koishi/TypeScript，1.0.1-beta6-rebuild）
+# 整个剧场引擎已按模块一比一移植到 hdsi/ 包（见 hdsi/PORTING_GUIDE.md、SERVICE_PORTING_SPEC.md）。
+# 本段只做"微信侧薄适配"：构造 InboundSession、注入角色设定与发送能力；
+# 回复/沉默/延迟/拆分/主动联系/幕间推进全部由 hdsi 内部逻辑驱动（对齐上游）。
+_hdsi_runtime = None
+_hdsi_runtime_error = None
+_hdsi_runtime_lock = threading.Lock()
+_hdsi_character_cache = {}
+_hdsi_character_lock = threading.Lock()
+
+# 记录各聊天正在"打字发送中"的文本片段（被打断即作为未说完的草稿参考）
 _typing_drafts = {}         # user -> [未发送文本片段]
 _typing_drafts_lock = threading.Lock()
 
+# 全局本地数据监听器实例（main 里赋值），用于群成员昵称解析/群记录回看
+localdb_listener_instance = None
 
-def _theater_llm(prompt):
-    """剧场叙事写作的 LLM 入口。默认用 THEATER_MODEL（文本模型，避免视觉模型空内容）。"""
-    try:
-        return call_chat_api_with_retry([{"role": "user", "content": prompt}], 'theater',
-                                        model=THEATER_MODEL or None)
-    except Exception as e:
-        logger.error(f'剧场 LLM 调用失败: {e}', exc_info=True)
-        raise
+
+def _resolve_sender(who, sender):
+    """把群消息发送者的 wxid 解析成真实昵称（通过群成员映射）。"""
+    if localdb_listener_instance:
+        try:
+            return localdb_listener_instance.resolve_sender(who, sender)
+        except Exception:
+            pass
+    return sender
 
 
 def _theater_image_recognize(image_path):
@@ -629,150 +641,236 @@ def _theater_image_recognize(image_path):
         return ''
 
 
-def _get_theater(user):
-    """每个用户/群聊单独开一个剧场：theater 以"聊天名"为名，而非 prompt。
-    多个聊天可以用同一角色设定，但各自有独立的生活剧本。"""
-    with theaters_lock:
-        t = theaters.get(user)
-        if t is None:
-            canon = ''
-            try:
-                canon = get_user_prompt(user)
-            except Exception as e:
-                logger.warning(f'获取角色设定失败: {e}')
-            t = Theater(
-                theater_id=user,
-                data_dir=os.path.join(root_dir, THEATER_DIR),
-                character_canon=canon,
-                llm_call=_theater_llm,
-                script_budget=THEATER_SCRIPT_BUDGET,
-                proactive_threshold=THEATER_PROACTIVE_THRESHOLD,
-                respect_quiet=THEATER_RESPECT_QUIET_TIME,
-                recent_context=THEATER_RECENT_CONTEXT,
-                alter_enabled=THEATER_ALTER_ENABLED,
-                alter_base_threshold=THEATER_ALTER_BASE_THRESHOLD,
-                min_proactive_interval_seconds=THEATER_MIN_PROACTIVE_INTERVAL_MINUTES * 60,
-                continuity_refresh_turns=THEATER_CONTINUITY_REFRESH_TURNS,
-                active_consequence_decay=THEATER_ACTIVE_CONSEQUENCE_DECAY,
-                image_recognizer=_theater_image_recognize,
-                # ---- HDS-Interlude 0.1.4 对齐参数 ----
-                time_director_enabled=THEATER_TIME_DIRECTOR_ENABLED,
-                followup_minutes=(THEATER_FOLLOWUP_MINUTES_1, THEATER_FOLLOWUP_MINUTES_2),
-                preplan_enabled=THEATER_PREPLAN_ENABLED,
-                preplan_review_hour=THEATER_PREPLAN_REVIEW_HOUR,
-                preplan_granularity=THEATER_PREPLAN_GRANULARITY,
-                preplan_anchor_advance=THEATER_PREPLAN_ANCHOR_ADVANCE,
-                proactive_enabled=THEATER_PROACTIVE_ENABLED,
-                compact_enabled=THEATER_COMPACT_ENABLED,
-                group_will_threshold=THEATER_GROUP_WILLINGNESS_THRESHOLD,
-                group_will_half_life=THEATER_GROUP_WILLINGNESS_HALF_LIFE_MINUTES * 60,
-            )
-            t.advance_interval_seconds = THEATER_ADVANCE_INTERVAL_MINUTES * 60
-            t.is_group = is_user_group_chat(user)
-            t.group_reply_probability = THEATER_GROUP_REPLY_PROBABILITY / 100.0
-            t.bubble_interval_hours = THEATER_BUBBLE_INTERVAL_HOURS
-            theaters[user] = t
-            logger.info(f'剧场《{user}》已就绪。')
-        return t
+def _guess_character_name(canon):
+    """从角色 Prompt 里猜一个显示名：取第一个非空、非纯符号的短行。"""
+    for raw_line in (canon or '').splitlines():
+        line = raw_line.strip().lstrip('#*-> \t')
+        if not line or len(line) > 40:
+            continue
+        if line.startswith(('[', '（', '(')) and line.endswith((']', '）', ')')):
+            continue
+        return line
+    return ''
 
 
-def _theater_handle(user, message, image_paths=None, drafts=None, reply_probability=1.0, force_reply=False, group_recent=None):
-    """走剧场叙事：返回要发送的文本，None 表示角色选择沉默/延迟。"""
-    t = _get_theater(user)
-    return t.handle_user_message(user, message, image_paths, drafts=drafts,
-                                 reply_probability=reply_probability, force_reply=force_reply,
-                                 group_recent=group_recent)
+def _hdsi_character_for(user):
+    """把该聊天的角色 Prompt 映射成上游 storyDefaults 的每角色设定。
 
-
-# 全局本地数据监听器实例（main 里赋值），用于被 @ 时回看最近群聊记录
-localdb_listener_instance = None
-
-
-def _resolve_sender(who, sender):
-    """把群消息发送者的 wxid 解析成真实昵称（通过群成员映射）。"""
-    if localdb_listener_instance:
-        try:
-            return localdb_listener_instance.resolve_sender(who, sender)
-        except Exception:
-            pass
-    return sender
-
-
-def _fetch_group_recent(user):
-    """被 @ 时回看该群最近 THEATER_RECENT_LOOKBACK 条消息（含图片识图），返回文本。"""
-    if not localdb_listener_instance:
-        return None
+    返回 dict（key/name/profile/timezone），供 HdsiRuntime 隔离主剧本：
+    使用同一角色 Prompt 的聊天共享同一部主剧本（对齐上游"一个主剧本、多位参与者"）。
+    """
+    with _hdsi_character_lock:
+        cached = _hdsi_character_cache.get(user)
+    if cached:
+        return cached
+    canon = ''
     try:
-        info = localdb_listener_instance.sessions.get(user)
-        if not info:
-            return None
-        msgs = localdb_listener_instance.fetch_messages(info.get('username', user), limit=THEATER_RECENT_LOOKBACK)
-        if not msgs:
-            return None
-        lines = []
-        recog_count = 0
-        for m in sorted(msgs, key=lambda x: float(x.get('createTime') or 0)):
-            try:
-                ts = time.strftime('%H:%M', time.localtime(float(m.get('createTime') or 0)))
-            except Exception:
-                ts = '??:??'
-            label = '自己' if int(m.get('isSend') or 0) == 1 else _resolve_sender(user, m.get('senderUsername') or '')
-            content = m.get('content') or ''
-            mt = (m.get('mediaType') or '').lower()
-            if mt in ('image', 'emoji') or '图片' in content or '表情' in content:
-                p = m.get('mediaLocalPath')
-                if p and os.path.exists(str(p)) and recog_count < 3:
-                    desc = _theater_image_recognize(p) or ''
-                    content = f'[图片：{desc}]' if desc else '[图片]'
-                    recog_count += 1
-                else:
-                    content = '[图片]'
-            content = (content or '').replace('\n', ' ')[:80]
-            lines.append(f'[{ts}] {label}: {content}')
-        return '\n'.join(lines)
+        canon = get_user_prompt(user) or ''
     except Exception as e:
-        logger.warning(f'回看群聊记录失败 {user}: {e}')
-        return None
+        logger.warning(f'[剧场] 读取角色设定失败 {user}: {e}')
+    character = {
+        'key': hashlib.sha1(canon.encode('utf-8')).hexdigest()[:12],
+        'name': _guess_character_name(canon) or user,
+        'profile': canon,
+        'timezone': 'Asia/Shanghai',
+    }
+    with _hdsi_character_lock:
+        _hdsi_character_cache[user] = character
+    return character
 
 
-def _theater_thread():
-    """幕间自动推进线程：定期让各角色生活推进，投递延迟回复与主动联系。"""
-    logger.info('剧场幕间推进线程已启动。')
-    while True:
+def _hdsi_group_rules():
+    """开启剧场模式的聊天 → 上游 onebot.groupChats 规则表（群聊按 groupId 命中）。"""
+    try:
+        from hdsi.group_willingness import DEFAULT_GROUP_WILLINGNESS
+    except Exception:
+        DEFAULT_GROUP_WILLINGNESS = {}
+    willingness = dict(DEFAULT_GROUP_WILLINGNESS or {})
+    willingness['enabled'] = bool(THEATER_GROUP_WILLINGNESS_ENABLED)
+    try:
+        willingness['decayHalfLifeSeconds'] = int(max(10, float(THEATER_GROUP_WILLINGNESS_HALF_LIFE_MINUTES) * 60))
+        threshold = float(THEATER_GROUP_WILLINGNESS_THRESHOLD)
+        if 0 < threshold <= 1:
+            willingness['threshold'] = threshold
+    except Exception:
+        pass
+    rules = []
+    for name in sorted(_THEATER_CHATS):
+        rules.append({
+            'groupId': name,
+            'label': name,
+            'enabled': True,
+            'purpose': '',
+            'characterRole': '',
+            # 已删除"未@就忽略（节省token）"门控：对齐上游 responseMode=always，
+            # 所有群消息进入剧场缓冲；是否调用主模型由群聊意愿层（显式开启时）决定。
+            'responseMode': 'always',
+            'contextLimit': max(4, min(100, int(THEATER_RECENT_LOOKBACK))),
+            'debounceSeconds': 1,
+            'cooldownSeconds': 60,
+            'willingness': willingness,
+        })
+    return rules
+
+
+def _hdsi_fetch_messages(chat_name, limit):
+    """读取本地库最近消息（供平台层查询群成员/上下文）。"""
+    if not localdb_listener_instance:
+        return []
+    try:
+        info = localdb_listener_instance.sessions.get(chat_name)
+        if not info:
+            return []
+        return localdb_listener_instance.fetch_messages(info.get('username', chat_name), limit=limit) or []
+    except Exception as e:
+        logger.warning(f'[剧场] 读取本地消息失败 {chat_name}: {e}')
+        return []
+
+
+def _get_hdsi_runtime():
+    """惰性创建 HDS-Interlude 运行时（整个剧场引擎）。"""
+    global _hdsi_runtime, _hdsi_runtime_error
+    with _hdsi_runtime_lock:
+        if _hdsi_runtime is not None:
+            return _hdsi_runtime
         try:
-            if ENABLE_THEATER:
-                with theaters_lock:
-                    snapshot = list(theaters.values())
-                for t in snapshot:
-                    try:
-                        delivered = t.advance(quiet_fn=is_quiet_time)
-                    except Exception as e:
-                        logger.error(f'剧场《{t.theater_id}》推进失败: {e}', exc_info=True)
-                        continue
-                    for d in delivered:
-                        target = d.get('target_user') or ''
-                        content = d.get('content') or ''
-                        if not target or not content:
-                            continue
-                        if not is_theater_chat(target):
-                            logger.info(f'剧场主动联系目标 {target} 未开启剧场模式，跳过。')
-                            continue
-                        if target not in user_names and _LOCALDB_ALIASES.get(target) not in user_names:
-                            logger.info(f'剧场主动联系目标 {target} 不在监听列表，跳过。')
-                            continue
-                        try:
-                            wx_op_lock.acquire()
-                            try:
-                                record_sent_text(content)
-                                _send_msg(target, content)
-                                logger.info(f'[剧场] 主动发送给 {target}: {content[:60]}')
-                            finally:
-                                wx_op_lock.release()
-                        except Exception as e:
-                            logger.error(f'[剧场] 发送给 {target} 失败: {e}')
+            from hdsi.index import HdsiRuntime, build_config
+            from hdsi.platform.wxbot import WxbotAdapter
+            from hdsi.store import get_store
         except Exception as e:
-            logger.error(f'剧场推进线程异常: {e}', exc_info=True)
-        time.sleep(60)
+            _hdsi_runtime_error = e
+            logger.error(f'[剧场] HDS-Interlude 运行时加载失败，剧场功能不可用: {e}', exc_info=True)
+            return None
+        try:
+            store = get_store(os.path.join(root_dir, THEATER_DIR, 'hdsi.sqlite3'))
+            adapter = WxbotAdapter(
+                base_dir=root_dir,
+                logger=logger,
+                send_text=_send_msg,
+                send_file=_send_file,
+                is_group=is_user_group_chat,
+                record_sent=record_sent_text,
+                resolve_sender=_resolve_sender,
+                fetch_messages=_hdsi_fetch_messages,
+                recognize_image=_theater_image_recognize,
+                op_lock=wx_op_lock,
+                sticker_dir=os.path.join(root_dir, 'emojis'),
+                platform_name='wechat',
+                self_id=(BOT_NICKNAME or 'wechat-bot'),
+            )
+            runtime_overrides = {
+                'autoCreate': True,
+                'autoAdvanceEnabled': True,
+                'autoAdvanceIntervalMinutes': max(5, int(THEATER_ADVANCE_INTERVAL_MINUTES)),
+                'sweepIntervalMinutes': max(1, min(5, int(THEATER_ADVANCE_INTERVAL_MINUTES))),
+                'allowProactiveMessages': bool(THEATER_PROACTIVE_ENABLED),
+                'contextEntryLimit': max(1, min(200, int(THEATER_SCRIPT_BUDGET))),
+                # 对话后续（上游 conversationFollowUpMinutes，默认 [10, 20]）
+                'conversationFollowUpMinutes': [
+                    max(1, int(THEATER_FOLLOWUP_MINUTES_1)),
+                    max(1, int(THEATER_FOLLOWUP_MINUTES_2)),
+                ],
+            }
+            try:
+                runtime_overrides['proactiveWillingnessThreshold'] = max(
+                    0.0, min(1.0, float(THEATER_PROACTIVE_THRESHOLD) / 100.0))
+            except Exception:
+                pass
+            if THEATER_RESPECT_QUIET_TIME:
+                runtime_overrides['restWindows'] = [{
+                    'enabled': True, 'label': 'night sleep', 'start': '22:00', 'end': '08:00',
+                    'minIntervalMinutes': 120, 'maxIntervalMinutes': 240,
+                }]
+            local_config = {
+                'api_key': DEEPSEEK_API_KEY,
+                'base_url': DEEPSEEK_BASE_URL,
+                'model': THEATER_MODEL or MODEL,
+                'main_temperature': TEMPERATURE,
+                'main_max_tokens': MAX_TOKEN,
+                'response_format': 'json-object',
+                'story_defaults': {
+                    'timezone': 'Asia/Shanghai',
+                    'style': '现实主义日常叙事，情绪克制，关系变化缓慢而具体。',
+                },
+                'runtime': runtime_overrides,
+                'memory': {
+                    'enabled': bool(THEATER_COMPACT_ENABLED),
+                    'recentEntryLimit': max(1, min(200, int(THEATER_RECENT_CONTEXT))),
+                    'activeConsequenceDefaultStrength': max(0.0, min(1.0, float(THEATER_ACTIVE_CONSEQUENCE_DECAY))),
+                },
+                'alterSystem': {'enabled': bool(THEATER_ALTER_ENABLED), 'baseThreshold': THEATER_ALTER_BASE_THRESHOLD},
+                'schedulePreplan': {
+                    'enabled': bool(THEATER_PREPLAN_ENABLED),
+                    'reviewAfterLocalHour': int(THEATER_PREPLAN_REVIEW_HOUR),
+                    'variationLevel': THEATER_PREPLAN_GRANULARITY,
+                    'anchorAutoAdvance': bool(THEATER_PREPLAN_ANCHOR_ADVANCE),
+                },
+                'timelineDirector': {'enabled': bool(THEATER_TIME_DIRECTOR_ENABLED)},
+                'agency': {
+                    'enabled': bool(THEATER_PROACTIVE_ENABLED),
+                    'minimumProactiveIntervalMinutes': max(0, int(THEATER_MIN_PROACTIVE_INTERVAL_MINUTES)),
+                },
+                'logging': {'level': 'info', 'logMessageContent': False},
+            }
+            config = build_config(local_config, theater_groups=_hdsi_group_rules())
+            _hdsi_runtime = HdsiRuntime(config, adapter, store, logger, root_dir)
+            logger.info('[剧场] HDS-Interlude 移植版运行时已启动（1.0.1-beta6-rebuild）。')
+            return _hdsi_runtime
+        except Exception as e:
+            _hdsi_runtime_error = e
+            logger.error(f'[剧场] HDS-Interlude 运行时初始化失败: {e}', exc_info=True)
+            return None
+
+
+def _is_group_chat_robust(user, message=None):
+    """判断该聊天是否为群聊：本地库会话信息优先，其次群聊前缀，最后回退缓存。"""
+    try:
+        if localdb_listener_instance:
+            info = localdb_listener_instance.sessions.get(user) or {}
+            if 'is_group' in info:
+                return bool(info.get('is_group'))
+    except Exception:
+        pass
+    if message:
+        import re as _re
+        if _re.match(r"\[群聊消息-来自群'", (message or '').lstrip()):
+            return True
+    return is_user_group_chat(user)
+
+
+def _hdsi_build_session(user, sender_name, username, message, image_paths=None, force_reply=False):
+    """构造上游 InboundSession（微信侧）。"""
+    from hdsi.platform.session import InboundSession, MessageElement
+    from hdsi.time_utils import now_utc
+    is_group = _is_group_chat_robust(user, message)
+    return InboundSession(
+        platform='wechat',
+        selfId=(BOT_NICKNAME or 'wechat-bot'),
+        userId=(sender_name or user),
+        username=(username or user),
+        channelId=user,
+        guildId=(user if is_group else ''),
+        isDirect=not is_group,
+        content=message or '',
+        messageId='',
+        elements=[MessageElement(type='image', value=p) for p in (image_paths or []) if p],
+        timestamp=now_utc(),
+        sender_name=(sender_name or user),
+        channel_name=user,
+        mentioned_bot=bool(force_reply),
+        quoted_bot=False,
+    )
+
+
+def _hdsi_handle_incoming(user, sender_name, username, message, image_paths=None, force_reply=False):
+    """把一条入站消息交给 hdsi 运行时；投递由运行时内部完成。"""
+    runtime = _get_hdsi_runtime()
+    if runtime is None:
+        logger.warning(f'[剧场] HDSI 运行时不可用，忽略 {user} 的消息。')
+        return False
+    session = _hdsi_build_session(user, sender_name, username, message, image_paths, force_reply)
+    runtime.receive(session, _hdsi_character_for(user))
+    return True
 
 # 存储用户的计时器和随机等待时间
 user_timers = {}
@@ -1951,24 +2049,16 @@ def message_listener(msg, chat):
         
         basic_trigger_met = ACCEPT_ALL_GROUP_CHAT_MESSAGES or at_triggered or keyword_triggered
 
-        # 剧场/全局阅读模式：默认只在被 @ 时处理（省 token）；
-        # 开启群聊意愿层后，未@消息累积本地意愿分数，超过阈值按概率触发一次剧场写作
+        # 剧场/全局阅读模式：所有群消息都进入 hdsi 的群聊缓冲（对齐上游 responseMode=always）。
+        # 原来的"未@就忽略（节省token）"门控已删除；是否真正调用主叙事由上游群聊逻辑决定：
+        #   - mention-only 规则：未 @ 不触发（本项目剧场群统一配置为 always）
+        #   - always 规则 + 显式开启群聊意愿层：由上游本地意愿分数决定（默认关闭）
         if is_theater_chat(who):
+            should_process_this_message = True
             if at_triggered:
-                should_process_this_message = True
                 logger.info(f"群聊 '{who}' @机器人，剧场处理（并回看最近消息）。")
             else:
-                should_process_this_message = False
-                if THEATER_GROUP_WILLINGNESS_ENABLED:
-                    try:
-                        t = _get_theater(who)
-                        if t.observe_group_message(sender, processed_group_content):
-                            should_process_this_message = True
-                            logger.info(f"群聊 '{who}' 群聊意愿触发，剧场处理该话题。")
-                    except Exception as e:
-                        logger.warning(f"剧场群聊意愿层异常（{who}）: {e}")
-                if not should_process_this_message:
-                    logger.info(f"群聊 '{who}' 未@机器人，忽略（节省token）。")
+                logger.info(f"群聊 '{who}' 未@机器人，进入剧场群聊缓冲（responseMode=always）。")
         elif basic_trigger_met:
             if not ACCEPT_ALL_GROUP_CHAT_MESSAGES:
                 if at_triggered and keyword_triggered:
@@ -2651,38 +2741,15 @@ def process_user_messages(user_id):
     online_info = None
 
     try:
-        # --- 剧场模式：AI 作为"演员"处理本条消息（补写幕间、决定回复/沉默/延迟） ---
+        # --- 剧场模式（HDS-Interlude 移植版）：交给 hdsi 运行时处理 ---
+        # 幕间补写、回复/沉默/延迟、气泡拆分、主动联系与投递全部由 hdsi 内部完成；
+        # 这里只负责构造 InboundSession 并清理临时图片文件。
         if is_theater_chat(user_id):
-            drafts = _typing_drafts.pop(user_id, None)  # 取走"上次还在打字没发完"的草稿
-            # 群聊回复降噪：剧场群的回复发送概率设为 THEATER_GROUP_REPLY_PROBABILITY %
-            if is_user_group_chat(user_id):
-                # 被 @ 了必须回，不受群聊降噪概率影响
-                rp = 1.0 if force_reply else max(0.0, min(1.0, THEATER_GROUP_REPLY_PROBABILITY / 100.0))
-            else:
-                rp = 1.0
             try:
-                group_recent = None
-                if force_reply and is_user_group_chat(user_id):
-                    group_recent = _fetch_group_recent(user_id)  # 被 @ 时回看最近消息+识图
-                reply = _theater_handle(user_id, merged_message, image_paths, drafts=drafts,
-                                        reply_probability=rp, force_reply=force_reply,
-                                        group_recent=group_recent)
+                _hdsi_handle_incoming(user_id, sender_name, username, merged_message,
+                                      image_paths=image_paths, force_reply=force_reply)
             except Exception as e:
                 logger.error(f"剧场处理失败 (用户: {user_id}): {e}", exc_info=True)
-                reply = None
-            if reply:
-                # 群聊意愿层：主角成功发言后消耗意愿（对齐 HDS-Interlude）
-                if is_user_group_chat(user_id) and THEATER_GROUP_WILLINGNESS_ENABLED:
-                    try:
-                        with theaters_lock:
-                            t = theaters.get(user_id)
-                        if t is not None:
-                            t.consume_group_will()
-                    except Exception:
-                        pass
-                send_reply(user_id, sender_name, username, merged_message, reply)
-            else:
-                logger.info(f"剧场模式：{user_id} 本轮角色选择沉默/延迟，不发送回复。")
             for img_p in image_paths:
                 try:
                     if img_p and os.path.exists(img_p) and ('wxautox文件下载' in img_p or 'localdb_media' in img_p):
@@ -5129,8 +5196,8 @@ def main():
 
         # 剧场模式：由"幕间推进"负责主动联系，不再启动旧的固定主动消息线程
         if ENABLE_THEATER:
-            theater_thread = threading.Thread(target=_theater_thread, name="TheaterAdvancer", daemon=True)
-            theater_thread.start()
+            # HDS-Interlude 移植版：后台幕间推进/到期意图/压缩由运行时自身的定时器驱动
+            _get_hdsi_runtime()
             logger.info("剧场幕间推进线程已启动（主动联系由剧场负责）。")
         else:
             # 自动消息 - 线程总是启动，但根据动态配置决定是否工作
