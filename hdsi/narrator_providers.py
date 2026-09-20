@@ -53,6 +53,7 @@ import codecs
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -76,6 +77,7 @@ from .narrator_prompts import (
     extract_early_narrative_reply,
     flatten_chat_text,
     has_usage_fields,
+    normalize_decoded_decision,
     parse_json_response,
     parse_object,
     parse_token_usage,
@@ -1067,6 +1069,7 @@ class OpenAICompatibleNarrator(NarrativeProvider, StickerDescriber, VisionDescri
             headers['authorization'] = 'Bearer %s' % provider['apiKey']
         headers.update(parse_object(provider.get('extraHeaders'), 'extraHeaders', self.logger))
 
+        finish_reason: Optional[str] = None
         if provider.get('zhipuOfficial'):
             text = _request_zhipu_streaming(
                 self.ctx,
@@ -1095,15 +1098,33 @@ class OpenAICompatibleNarrator(NarrativeProvider, StickerDescriber, VisionDescri
                 timeout_ms=_timeout_ms(_coalesce(overrides.get('timeout'), provider.get('timeout'))),
             )
             collect(response.get('usage') if isinstance(response, dict) else None)
+            finish_reason = _finish_reason(response)
             text = extract_chat_text(response)
         if not text:
             raise RuntimeError('Narrative provider returned an empty response.')
 
         try:
-            decision: NarrativeDecision = parse_json_response(text, 'Narrative provider')
+            raw_decision = parse_json_response(text, 'Narrative provider')
         except Exception as error:  # noqa: BLE001 - 上游 catch(error) 语义
-            self._debug('叙事模型返回了无效 JSON：%s', error)
+            detail = _error_message(error)
+            # 诊断（不改变上游语义）：记录 finish_reason、字符数与原文预览，并落盘完整原文，
+            # 便于区分“被 max_tokens 截断”（finish_reason=length）与“模型没按 JSON 合约输出”（stop）。
+            self._warn('叙事模型返回无法解析的 JSON 错误=%s finish_reason=%s 字符数=%d 预览=%s',
+                       detail[:200], finish_reason or '-', len(text), str(text)[:300].replace('\n', ' '))
+            _dump_invalid_decision(text, finish_reason, detail)
             raise RuntimeError('Narrative provider returned invalid JSON.')
+
+        # 上游允许数组根，JS 读字段得到 undefined 会自然降级；Python 需要显式归一化。
+        decision: NarrativeDecision = normalize_decoded_decision(raw_decision)
+        if not isinstance(raw_decision, dict):
+            if decision:
+                self._warn('叙事模型返回了 JSON %s 根（%s），已取第一个对象元素 预览=%s',
+                           type(raw_decision).__name__,
+                           ('%d 项' % len(raw_decision)) if isinstance(raw_decision, list) else '-',
+                           str(text)[:120])
+            else:
+                self._warn('叙事模型返回了非对象 JSON 根（%s），按空决策处理 预览=%s',
+                           type(raw_decision).__name__, str(text)[:120])
 
         # Observability must not fail a valid generation or activate provider retry.
         try:
@@ -1878,6 +1899,41 @@ def _sticker_max_tokens(max_tokens: Any) -> int:
 def _now_ms() -> int:
     """TS: Date.now()"""
     return int(time.time() * 1000)
+
+
+def _finish_reason(response: Any) -> Optional[str]:
+    """取 OpenAI 兼容响应的 finish_reason（stop / length / content_filter…）。
+
+    'length' 表示输出被 max_tokens 截断，是"JSON 不完整/无法解析"最常见的原因。
+    """
+    if not isinstance(response, dict):
+        return None
+    choices = response.get('choices')
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        value = choices[0].get('finish_reason')
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _dump_invalid_decision(text: str, finish_reason: Optional[str], detail: str,
+                           directory: Optional[str] = None) -> None:
+    """把无法解析的主叙事原文写入 Memory_Temp/hdsi_invalid_json.txt（只留最近一次）。
+
+    纯诊断副作用：写失败静默，不影响主流程；Memory_Temp/ 已在 .gitignore 中，
+    便于用户把这份原文直接发出来定位（是截断还是没按 JSON 合约输出）。
+    """
+    try:
+        if directory is None:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            directory = os.path.join(root, 'Memory_Temp')
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, 'hdsi_invalid_json.txt'), 'w', encoding='utf-8') as handle:
+            handle.write('time_ms=%d\nfinish_reason=%s\nchars=%d\nerror=%s\n\n'
+                         % (_now_ms(), finish_reason or '-', len(text), detail))
+            handle.write(text)
+    except Exception:  # noqa: BLE001 - 诊断失败不能影响主流程
+        pass
 
 
 def _error_message(error: Any) -> str:

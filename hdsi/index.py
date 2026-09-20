@@ -184,6 +184,10 @@ class HdsiRuntime:
         if self._closed:
             return
         session = self.character_scoped_session(session, character)
+        # 把每个聊天的角色 Prompt（名字/profile）写入或更新到对应主剧本。
+        # 之前这里遗漏调用，故事一直是默认的 'Unnamed character' + 空 profile，
+        # 模型因此既没有人设、也不认识自己的微信昵称，被 @ 也只会沉默。
+        self.ensure_story(session, character)
         try:
             if session.isDirect:
                 self.service.receive(session, session.timestamp)

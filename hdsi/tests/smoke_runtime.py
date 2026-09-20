@@ -113,6 +113,13 @@ class FakeNarrator:
         return {'description': '心情平静。'}
 
 
+class WrappedListNarrator(FakeNarrator):
+    """回归用：把决策对象包在 JSON 数组里返回（线上触发过 'list' object has no attribute 'get'）。"""
+
+    def decide(self, request):
+        return [super().decide(request)]
+
+
 class FakeCompactor:
     def compact(self, request):
         return {}
@@ -143,7 +150,7 @@ def main() -> int:
             'api_key': 'test-key',
             'base_url': 'https://example.invalid/v1',
             'model': 'test-model',
-            'story_defaults': {'characterName': '小茶', 'characterProfile': '测试角色', 'timezone': 'Asia/Shanghai'},
+            'story_defaults': {'characterName': '默认名', 'characterProfile': '默认档案', 'timezone': 'Asia/Shanghai'},
             'runtime': {'autoCreate': True, 'autoAdvanceEnabled': True, 'autoAdvanceIntervalMinutes': 60,
                         'sweepIntervalMinutes': 60, 'userMessageDebounceSeconds': 0},
             'logging': {'level': 'info'},
@@ -179,6 +186,31 @@ def main() -> int:
         assert len(participants) == 1, participants
         print('[smoke] 剧本条目:', [e.get('kind') for e in entries])
 
+        # 回归：HdsiRuntime.receive 必须把每聊天角色设定写进主剧本
+        # （storyDefaults 用的是"默认名/默认档案"，这里应被 character 覆盖）
+        applied = store.get('interlude_story', {'id': story_id})[0]['setting']['character']
+        assert applied.get('name') == '小茶', applied
+        assert applied.get('profile') == '测试角色', applied
+        print('[smoke] 角色设定已写入故事:', applied.get('name'), '/', applied.get('profile'))
+
+        # 1b) 回归：模型把决策对象包在 JSON 数组里，也应正常落库与投递
+        adapter.sent.clear()
+        runtime.service.set_narrator(WrappedListNarrator())
+        session2 = InboundSession(
+            platform='wechat', selfId='bot', userId='u2', username='u2', channelId='u2',
+            isDirect=True, content='在吗', timestamp=now_utc(), sender_name='u2',
+        )
+        # 1c) 回归：历史遗留的空人设剧本（Unnamed character / 空 profile）应在下次消息被补写
+        runtime.service.update_setting(runtime.service.find_story(session), {
+            'character': {'name': 'Unnamed character', 'profile': ''}})
+        runtime.receive(session2, character)
+        assert wait_for(lambda: bool(adapter.sent)), '数组根决策没有正常投递（回归失败）'
+        print('[smoke] 数组根决策已恢复并投递:', adapter.sent[-1])
+        repaired = runtime.service.find_story(session2)['setting']['character']
+        assert repaired.get('name') == '小茶' and repaired.get('profile') == '测试角色', repaired
+        print('[smoke] 遗留空人设已自动补写:', repaired.get('name'), '/', repaired.get('profile'))
+        runtime.service.set_narrator(narrator)
+
         # 2) 群聊：进入群缓冲并触发一次群叙事（groupReply 协议）
         group_session = InboundSession(
             platform='wechat', selfId='bot', userId='member-a', username='member-a', channelId='测试群',
@@ -192,6 +224,10 @@ def main() -> int:
         assert wait_for(lambda: any(item['kind'] == 'group' for item in adapter.sent)), '群聊回复没有投递'
         assert wait_for(lambda: not runtime.service.has_pending_narrative(story_id)), '群聊回合未结算'
         print('[smoke] 群聊回复:', [item for item in adapter.sent if item['kind'] == 'group'][-1])
+        # 回归：微信平台层会把 @昵称 从正文删掉，引擎必须显式提示模型“被点名了”
+        group_request = narrator.requests[-1]
+        assert '系统提示：这批群消息 @ 了你' in (group_request.get('userMessage') or ''), group_request.get('userMessage')
+        print('[smoke] 群聊被 @ 提示已注入模型请求')
 
         # 3) 后台自动推进：把 nextAdvanceAt 拨到过去，sweep 应补写一段生活
         from datetime import timedelta

@@ -461,6 +461,26 @@ def parse_json_response(text: Any, source: str) -> Any:
     raise ValueError(f'{source} returned invalid JSON ({detail}).')
 
 
+def normalize_decoded_decision(value: Any) -> Dict[str, Any]:
+    """把模型 JSON 根归一化成决策对象。
+
+    上游 parseJsonResponse 允许数组/标量根（`value && typeof value === 'object'`）。
+    在 JS 里对数组读 `.script` 只会得到 undefined，后续自然按"没有 script"降级；
+    Python 的 `.get` 会直接抛 AttributeError，因此这里显式归一化：
+
+    - dict：原样返回；
+    - list：取第一个 dict 元素（兼容模型把决策对象包在数组里的常见写法）；
+    - 其它（空数组 / 标量 / None）：返回空 dict，等价于上游"读不到任何字段"。
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
 def json_candidates(text: str) -> List[str]:
     """上游 jsonCandidates：原文、代码围栏体（含未闭合围栏）与其中平衡的 JSON 值。"""
     if not text:

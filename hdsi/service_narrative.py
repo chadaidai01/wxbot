@@ -43,7 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from .agency import active_agency_window
 from .delivery import delivery_entry_metadata, restore_message_event
 from .logging import phase_label
-from .narrator import compact_prompt_entries
+from .narrator import compact_prompt_entries, normalize_decoded_decision
 from .schedule_preplan import schedule_preplan_window
 from .script.authored_actions import resolve_authored_actions
 from .script.development import development_context_query
@@ -1595,9 +1595,10 @@ class ServiceNarrativeMixin:
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
-        return resolve_authored_actions(
+        # 注入的 provider 也可能返回非对象 JSON 根：统一归一化，避免后续 .get 抛 AttributeError。
+        return normalize_decoded_decision(resolve_authored_actions(
             self.narrator.decide(request), False, _runtime_value(self.config, 'messageSeparator'),
-        )
+        ))
 
     # ================= 上游 3604-3608：shouldRefreshContinuity =================
 
@@ -1943,7 +1944,7 @@ class ServiceNarrativeMixin:
                 # 让下一次"结构化可见回复缺失"可以直接从日志定位是模型行为还是解析问题。
                 if initial_visible_recovery:
                     self.report_operation(
-                        'diagnostic', 'warn', story, phase, '被抛弃草稿的结构化回复字段 interaction=%s groupReply=%s',
+                        'standard', 'warn', story, phase, '被抛弃草稿的结构化回复字段 interaction=%s groupReply=%s',
                         _preview(_get(decision, 'interaction')), _preview(_get(decision, 'groupReply')),
                     )
                 if initial_time_overflow:
@@ -1971,7 +1972,7 @@ class ServiceNarrativeMixin:
                     )
                 if main_available and not early_reply_committed and requires_visible_reply_recovery(phase, group_context, decision):
                     self.report_operation(
-                        'diagnostic', 'warn', story, phase,
+                        'standard', 'warn', story, phase,
                         '恢复尝试仍缺失结构化回复 interaction=%s', _preview(_get(decision, 'interaction')),
                     )
                     raise Exception('Narrative provider omitted the required visible-reply structure after one recovery attempt.')

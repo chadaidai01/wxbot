@@ -52,6 +52,7 @@ from .narrator_prompts import (  # noqa: F401
     compute_token_cost,
     extract_early_narrative_reply,
     format_token_usage_line,
+    normalize_decoded_decision,
     parse_token_usage,
     prompt_visible_message_content,
     recent_script_ownership,

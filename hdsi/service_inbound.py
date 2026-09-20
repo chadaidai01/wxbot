@@ -720,13 +720,16 @@ class ServiceInboundMixin:
                 self.buffered_group_turns.pop(key, None)
             return
         rule = turn.get('rule') or {}
+        # 先记住本批是否被 @（下面要重置 turn 标记供下一批使用）。
+        mentioned_in_batch = bool(turn.get('mentionedBot'))
+        quoted_in_batch = bool(turn.get('quotedBot'))
         willingness = evaluate_group_willingness(
             self.group_willingness.get(key),
             _field(rule, 'willingness'),
             {
                 'now': _now_ms(), 'messageCount': len(batch),
                 'content': '\n'.join(_js_string(_field(message, 'content')) for message in batch),
-                'mentionedBot': turn.get('mentionedBot'), 'quotedBot': turn.get('quotedBot'),
+                'mentionedBot': mentioned_in_batch, 'quotedBot': quoted_in_batch,
             },
         )
         self.group_willingness[key] = willingness['state']
@@ -768,12 +771,21 @@ class ServiceInboundMixin:
                 'groupId': turn.get('groupId'), 'channelId': turn.get('channelId'), 'label': _field(rule, 'label'),
                 'purpose': _field(rule, 'purpose'), 'characterRole': _field(rule, 'characterRole'),
                 'messages': snapshot.get('contextMessages'),
+                'mentionedBot': mentioned_in_batch,
             }
             chat_capabilities = self.group_chat_capabilities(turn.get('latestSession'), group_context.get('messages'))
             user_message = '\n\n'.join(
                 '[群聊连续消息 %d｜%s]\n%s' % (index + 1, _field(message, 'speaker'), _field(message, 'content'))
                 for index, message in enumerate(batch)
             )
+            if mentioned_in_batch:
+                # 微信平台层为了做 @ 触发判定，会把「@机器人昵称」从正文里删掉，
+                # 模型因此看不到"被点名"。这里显式补一条系统提示，保证被 @ 的回合一定回复。
+                user_message = (
+                    '【系统提示：这批群消息 @ 了你（点名了角色）。本回合必须给出可见的群回复：'
+                    'groupReply.mode="immediate" 且 content 非空；不要沉默、不要选择 none。】\n\n'
+                    + user_message
+                )
             turn_query_embedding = None
             if self.semantic_turn_embedding_enabled():
                 max_input = _config_get(self.config, 'model', 'embedding', 'maxInputCharacters', default=4_000)

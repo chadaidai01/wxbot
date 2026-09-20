@@ -642,14 +642,21 @@ def _theater_image_recognize(image_path):
 
 
 def _guess_character_name(canon):
-    """从角色 Prompt 里猜一个显示名：取第一个非空、非纯符号的短行。"""
+    """从角色 Prompt 里猜一个显示名。
+
+    优先识别「角色人设：X」「名字：X」「Name: X」这类写法，取到 X；
+    否则回退到第一个非空短行（截到括号前）。
+    """
     for raw_line in (canon or '').splitlines():
         line = raw_line.strip().lstrip('#*-> \t')
-        if not line or len(line) > 40:
+        if not line or len(line) > 60:
             continue
         if line.startswith(('[', '（', '(')) and line.endswith((']', '）', ')')):
             continue
-        return line
+        matched = re.search(r'(?:角色人设|角色名|角色|名字|名称|Name)\s*[:：]\s*([^（(【\[,，·|/]{1,24})', line)
+        if matched:
+            return matched.group(1).strip()
+        return line.split('（')[0].split('(')[0].strip()[:24]
     return ''
 
 
@@ -658,21 +665,30 @@ def _hdsi_character_for(user):
 
     返回 dict（key/name/profile/timezone），供 HdsiRuntime 隔离主剧本：
     使用同一角色 Prompt 的聊天共享同一部主剧本（对齐上游"一个主剧本、多位参与者"）。
+    额外写入「微信身份」说明：微信群 @ 机器人昵称后，平台层会把 @ 从正文里删掉，
+    所以要把微信昵称告诉模型，否则它不知道 "@某某" 是在叫自己。
     """
+    display_name = (ROBOT_WX_NAME or BOT_NICKNAME or '').strip()
     with _hdsi_character_lock:
         cached = _hdsi_character_cache.get(user)
-    if cached:
+    # 缓存按「用户 + 当前微信昵称」生效：昵称在 wxbot 初始化后才可用，变化时重建。
+    if cached and cached.get('_display') == display_name:
         return cached
     canon = ''
     try:
         canon = get_user_prompt(user) or ''
     except Exception as e:
         logger.warning(f'[剧场] 读取角色设定失败 {user}: {e}')
+    identity = ''
+    if display_name:
+        identity = ('【微信身份】你在微信里显示的昵称是「%s」；群里有人发「@%s」就是在叫你，'
+                    '被叫到时必须回复。\n\n' % (display_name, display_name))
     character = {
         'key': hashlib.sha1(canon.encode('utf-8')).hexdigest()[:12],
         'name': _guess_character_name(canon) or user,
-        'profile': canon,
+        'profile': identity + canon,
         'timezone': 'Asia/Shanghai',
+        '_display': display_name,
     }
     with _hdsi_character_lock:
         _hdsi_character_cache[user] = character
@@ -785,8 +801,9 @@ def _get_hdsi_runtime():
                 'api_key': DEEPSEEK_API_KEY,
                 'base_url': DEEPSEEK_BASE_URL,
                 'model': THEATER_MODEL or MODEL,
-                'main_temperature': TEMPERATURE,
-                'main_max_tokens': MAX_TOKEN,
+                # 剧场可以单独覆盖采样温度与输出上限；未配置时回退到全局值。
+                'main_temperature': float(globals().get('THEATER_TEMPERATURE') or TEMPERATURE or 0.8),
+                'main_max_tokens': int(globals().get('THEATER_MAX_TOKEN') or MAX_TOKEN or 4096),
                 'response_format': 'json-object',
                 'story_defaults': {
                     'timezone': 'Asia/Shanghai',
