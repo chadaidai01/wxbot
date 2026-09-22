@@ -4797,6 +4797,30 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         <small>映射上游 groupChats[].willingness（默认关闭）。关闭时所有群消息都进入群聊缓冲；开启后未@消息按本地分数决定是否调用主模型，@机器人始终直接通过。</small>
                     </div>
                     <div class="form-group">
+                        <label for="theaterGroupCooldownInput">群聊冷却 (秒):</label>
+                        <input type="number" min="0" max="3600" id="theaterGroupCooldownInput" name="THEATER_GROUP_COOLDOWN_SECONDS" value="{{ config.THEATER_GROUP_COOLDOWN_SECONDS }}">
+                        <small>角色在群里发言后多少秒内不再接话（防止刷屏）。0 = 不冷却，每条消息都进入主叙事。</small>
+                    </div>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>偷表情包（微信动画表情原文件自动收藏）</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_STICKER_STEAL_ENABLED" {% if config.THEATER_STICKER_STEAL_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>开启后：群里/私聊里别人发的动画表情会通过 WeFlow 直接取到原文件（gif/png/jpg），由视觉模型判断放进哪个心情分类；普通图片消息不偷，截图也不偷。</small>
+                    </div>
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>本地表情包库（角色可以在回复里自己发）</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="THEATER_STICKERS_ENABLED" {% if config.THEATER_STICKERS_ENABLED %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>开启后角色在剧场回复里能自己挑一张本地表情包发出来（包括偷来的）。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="theaterStickerDirInput">表情包库目录:</label>
+                        <input type="text" id="theaterStickerDirInput" name="THEATER_STICKER_DIR" value="{{ config.THEATER_STICKER_DIR }}" placeholder="emojis">
+                        <small>相对项目根目录；默认 emojis（原主动表情包目录，按心情分子文件夹）。</small>
+                    </div>
+                    <div class="form-group">
                         <label for="theaterGroupWillThInput">群聊意愿触发阈值 (分数):</label>
                         <input type="number" step="0.01" min="0" max="1" id="theaterGroupWillThInput" name="THEATER_GROUP_WILLINGNESS_THRESHOLD" value="{{ config.THEATER_GROUP_WILLINGNESS_THRESHOLD }}">
                         <small>映射上游 willingness.threshold（0-1）；大于 1 的旧值会被忽略并使用上游默认 0.24。</small>
@@ -5169,6 +5193,23 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         <small>温度越高，ai思维越发散，但是温度过高可能导致ai胡言乱语。</small>
                     </div>
                     </div>
+
+                    <div class="form-group" style="border-top:1px dashed #ddd; padding-top:12px;">
+                        <small><b>偷表情包分类专用 API（可选）</b>：只用于把偷到的动画表情扔给视觉模型"读取 + 分类"，然后放进 <code>emojis/&lt;心情&gt;/</code>。独立于人设/聊天模型——不挂人设 prompt、不产生任何回复。三项都填才生效；留空则复用上面的图片识别 API。</small>
+                    </div>
+                    <div class="form-group">
+                        <label>分类 API 地址:</label>
+                        <input type="text" name="STICKER_CLASSIFY_BASE_URL" value="{{ config.STICKER_CLASSIFY_BASE_URL }}" placeholder="留空=复用图片识别API，例如 https://api.deepseek.com">
+                        <small>填到域名或 /v1 即可，不要带 /chat/completions。</small>
+                    </div>
+                    <div class="form-group">
+                        <label>分类模型:</label>
+                        <input type="text" name="STICKER_CLASSIFY_MODEL" value="{{ config.STICKER_CLASSIFY_MODEL }}" placeholder="留空=复用图片识别模型，需支持图片输入">
+                    </div>
+                    <div class="form-group">
+                        <label>分类 API Key:</label>
+                        <input type="text" name="STICKER_CLASSIFY_API_KEY" value="{{ config.STICKER_CLASSIFY_API_KEY }}" placeholder="留空=复用图片识别API Key" class="api-key-input">
+                    </div>
                 </div>
 
                 <div id="section-online-search" class="content-panel">
@@ -5290,6 +5331,13 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         <input type="number" id="groupProactiveProbabilityInput" name="GROUP_PROACTIVE_REPLY_PROBABILITY"
                                min="0" max="100" step="1" value="{{ config.GROUP_PROACTIVE_REPLY_PROBABILITY }}">
                         <small>与上方"群聊回复概率"完全独立：未@、未命中关键词时，按此概率主动回复群友消息。复读机和消息轰炸不受此概率影响。</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="groupProactiveContextInput">随机接话时读取的群聊记录条数:</label>
+                        <input type="number" id="groupProactiveContextInput" name="GROUP_PROACTIVE_REPLY_CONTEXT_COUNT"
+                               min="0" max="200" step="1" value="{{ config.GROUP_PROACTIVE_REPLY_CONTEXT_COUNT }}">
+                        <small>未@、未命中关键词、按"主动回复概率"或"群聊回复概率"触发时，先拉取最近这么多条群聊记录作为上下文，再回复触发的那条消息。0 = 不读取，直接回复。</small>
                     </div>
 
                     <div class="form-group">

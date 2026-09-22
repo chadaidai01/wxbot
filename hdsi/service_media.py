@@ -766,26 +766,13 @@ def _sticker_mime(file_path: str) -> str:
 
 
 def _list_sticker_files(platform: Any, root: str) -> List[str]:
-    """上游 7309-7323 listStickerFiles：最多 3 层子目录，只收 png/jpe?g/webp/gif，最后排序。
+    """本地递归扫描贴纸库，等价上游 listStickerFiles（最多 3 层子目录、只收图片、排序）。
 
-    平台映射：node:fs/promises readdir → PlatformAdapter.list_files(root)（返回含 path 的条目）。
+    平台适配：上游是递归 readdir；本项目平台适配器的 list_files 只列一层，
+    而贴纸库是 emojis/<心情>/xxx 这种多级结构，所以直接用本地递归扫描。
     """
-    files: List[str] = []
-    for item in platform.list_files(root) or []:
-        path = _field(item, 'path')
-        if not isinstance(path, str) or not path:
-            continue
-        relative = os.path.relpath(path, root)
-        if relative == '..' or relative.startswith('..' + os.sep):
-            continue
-        depth = len([part for part in relative.replace(os.sep, '/').split('/') if part]) - 1
-        if depth > 3:
-            continue
-        if not _IMAGE_FILE_EXTENSIONS.search(os.path.basename(path)):
-            continue
-        files.append(path)
-    files.sort()
-    return files
+    from .service_helpers import list_sticker_files as scan_sticker_files
+    return scan_sticker_files(root)
 
 
 def _narrative_cursor(story: Dict[str, Any], now: datetime) -> datetime:
@@ -1395,7 +1382,11 @@ class ServiceMediaMixin:
                                     turn_query_embedding: Optional[List[float]] = None) -> List[StickerCatalogEntry]:
         """上游 stickerCatalogForSession：只向 OneBot 会话语境暴露贴纸目录。"""
         config = self.sticker_config
-        if not config.get('enabled') or not session or not is_one_bot_platform(session.platform):
+        if not config.get('enabled') or not session:
+            return []
+        # 平台适配：上游只向 OneBot 暴露贴纸目录；微信侧同样实现了 send_sticker 与本地贴纸库，
+        # 这里放开，让角色也能使用本地表情包（偷来的表情包也靠这个进入模型目录）。
+        if not is_one_bot_platform(session.platform) and session.platform != 'wechat':
             return []
         assets = self.rank_sticker_assets(turn_query_embedding)
         return [{
@@ -1919,7 +1910,9 @@ class ServiceMediaMixin:
             frame = self.render_animated_image_frame(data_uri)
             if frame:
                 return frame
-            self.report_standalone('warn', '动态图片未能抽帧，已使用原始图片输入；请启用 Puppeteer 以提高识别兼容性。')
+            # 平台没有抽帧能力时（当前微信适配器即如此），直接把原文件交给视觉模型；
+            # deepseek-flash 已实测可直接吃 GIF，不再需要 Puppeteer/GIF 抽帧。
+            self.report_standalone('debug', '动态图片未抽帧，已直接使用原文件输入。')
         scaled = self.downscale_image_for_vision({'mimeType': normalized, 'dataUri': data_uri})
         return scaled if scaled else {'mimeType': normalized, 'dataUri': data_uri}
 

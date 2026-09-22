@@ -746,8 +746,9 @@ class ServiceInboundMixin:
                 self.buffered_group_turns.pop(key, None)
             return
         if self.group_cooldown_active(story.get('id'), turn.get('groupId'), _field(rule, 'cooldownSeconds', 0)):
-            self.report_operation('diagnostic', 'debug', story, 'user-message',
-                                  '群聊仍在冷却期，跳过群发言 群=%s', turn.get('groupId'))
+            self.report_operation('standard', 'info', story, 'user-message',
+                                  '群聊仍在冷却期，跳过本批群消息 群=%s 冷却=%s秒',
+                                  turn.get('groupId'), _field(rule, 'cooldownSeconds', 0))
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return

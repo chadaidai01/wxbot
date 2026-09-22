@@ -35,6 +35,7 @@ from threading import Timer
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import os
+import sticker_steal
 import ctypes
 os.environ["PROJECT_NAME"] = 'iwyxdxl/WeChatBot_WXAUTO_SE'
 # 本地数据监听 (UserDataIsSafeFromUsers HTTP API)
@@ -618,6 +619,55 @@ _typing_drafts_lock = threading.Lock()
 localdb_listener_instance = None
 
 
+def _fetch_group_history_text(who, count, exclude_local_id=None):
+    """读取该群最近 count 条聊天记录，格式化成给模型看的上下文。
+
+    仅用于非剧场群聊的“随机接话”：未@、未命中关键词、按概率触发后，
+    先把最近的群聊记录喂给模型，再让它顺着语境回复触发的那条消息。
+    """
+    try:
+        limit = int(count or 0)
+    except Exception:
+        limit = 0
+    if limit <= 0 or not localdb_listener_instance:
+        return ''
+    limit = max(1, min(limit, 200))
+    messages = _hdsi_fetch_messages(who, limit + 1)
+    if not messages:
+        return ''
+    try:
+        rows = sorted(messages, key=lambda item: int(item.get('localId') or 0))
+    except Exception:
+        rows = list(reversed(messages))
+    # 当前触发消息也在最近记录里，排除掉避免重复；上下文最多保留 count 条
+    if exclude_local_id is not None:
+        rows = [item for item in rows if str(item.get('localId')) != str(exclude_local_id)]
+    rows = rows[-limit:]
+    lines = []
+    for item in rows:
+        content = str(item.get('content') or '').strip()
+        if not content:
+            continue
+        if str(item.get('isSend') or '0') in ('1', 'true', 'True'):
+            speaker = '我'
+        else:
+            speaker = _resolve_sender(who, item.get('senderUsername') or '') or '群友'
+        stamp = ''
+        try:
+            stamp = '[' + datetime.fromtimestamp(int(item.get('createTime'))).strftime('%H:%M') + '] '
+        except Exception:
+            stamp = ''
+        lines.append('%s%s: %s' % (stamp, speaker, content.replace('\n', ' ')))
+    if not lines:
+        return ''
+    text = '\n'.join(lines)
+    if len(text) > 4000:  # 防止一次把上下文塞爆
+        text = text[-4000:]
+    return ('【本群最近聊天记录（按时间正序，仅用于理解语境）】\n'
+            + text
+            + '\n【请顺着上面的语境，回复下面这一条群消息；像真人一样自然接话】')
+
+
 def _resolve_sender(who, sender):
     """把群消息发送者的 wxid 解析成真实昵称（通过群成员映射）。"""
     if localdb_listener_instance:
@@ -669,22 +719,25 @@ def _hdsi_character_for(user):
     所以要把微信昵称告诉模型，否则它不知道 "@某某" 是在叫自己。
     """
     display_name = (ROBOT_WX_NAME or BOT_NICKNAME or '').strip()
-    with _hdsi_character_lock:
-        cached = _hdsi_character_cache.get(user)
-    # 缓存按「用户 + 当前微信昵称」生效：昵称在 wxbot 初始化后才可用，变化时重建。
-    if cached and cached.get('_display') == display_name:
-        return cached
+    # 每次都重新读人设文件：缓存必须同时匹配「微信昵称 + 人设内容」。
+    # 只按聊天缓存在文件被编辑后会继续用旧人设，导致不同聊天生成不同主剧本 key，
+    # 进而触发“一个实例只保留一个 active 主剧本”的归档逻辑，把正在用的剧本归档掉。
     canon = ''
     try:
         canon = get_user_prompt(user) or ''
     except Exception as e:
         logger.warning(f'[剧场] 读取角色设定失败 {user}: {e}')
+    canon_key = hashlib.sha1(canon.encode('utf-8')).hexdigest()[:12]
+    with _hdsi_character_lock:
+        cached = _hdsi_character_cache.get(user)
+    if cached and cached.get('_display') == display_name and cached.get('key') == canon_key:
+        return cached
     identity = ''
     if display_name:
         identity = ('【微信身份】你在微信里显示的昵称是「%s」；群里有人发「@%s」就是在叫你，'
                     '被叫到时必须回复。\n\n' % (display_name, display_name))
     character = {
-        'key': hashlib.sha1(canon.encode('utf-8')).hexdigest()[:12],
+        'key': canon_key,
         'name': _guess_character_name(canon) or user,
         'profile': identity + canon,
         'timezone': 'Asia/Shanghai',
@@ -710,6 +763,10 @@ def _hdsi_group_rules():
             willingness['threshold'] = threshold
     except Exception:
         pass
+    try:
+        cooldown_seconds = max(0, int(globals().get('THEATER_GROUP_COOLDOWN_SECONDS', 60)))
+    except Exception:
+        cooldown_seconds = 60
     rules = []
     for name in sorted(_THEATER_CHATS):
         rules.append({
@@ -723,7 +780,7 @@ def _hdsi_group_rules():
             'responseMode': 'always',
             'contextLimit': max(4, min(100, int(THEATER_RECENT_LOOKBACK))),
             'debounceSeconds': 1,
-            'cooldownSeconds': 60,
+            'cooldownSeconds': cooldown_seconds,
             'willingness': willingness,
         })
     return rules
@@ -775,6 +832,16 @@ def _get_hdsi_runtime():
                 self_id=(BOT_NICKNAME or 'wechat-bot'),
             )
             runtime_overrides = {
+                # 本地表情包库：偷来的表情包就放在 emojis/<心情>/，让角色也能发出来
+                'stickers': {
+                    'enabled': bool(globals().get('THEATER_STICKERS_ENABLED', True)),
+                    'directory': str(globals().get('THEATER_STICKER_DIR', EMOJI_DIR) or EMOJI_DIR),
+                    'maxFileSizeMB': 30,
+                    'catalogLimit': 80,
+                    # deepseek-flash 是思考模型：先花 400~600 tokens 推理再输出描述，
+                    # 768 的默认上限容易被思考吃光导致描述为空、素材一直 pending。
+                    'descriptionMaxTokens': 2048,
+                },
                 'autoCreate': True,
                 'autoAdvanceEnabled': True,
                 'autoAdvanceIntervalMinutes': max(5, int(THEATER_ADVANCE_INTERVAL_MINUTES)),
@@ -1950,12 +2017,24 @@ def message_listener(msg, chat):
         else:
             original_content = f"[合并转发消息]: {mergecontent}"
     
+    # 偷表情包：不依赖 hdsi 是否开启、也不管这条消息后面会不会被回复；
+    # 收到动画表情就尝试从 WeFlow 本地库拿原文件收藏（没有原文件就跳过，不偷截图）。
+    if (msgtype == 'emotion' and msgattr != 'self'
+            and bool(globals().get('THEATER_STICKER_STEAL_ENABLED', True))):
+        try:
+            sticker_path = msg.download()
+            if sticker_path and os.path.exists(str(sticker_path)):
+                _maybe_steal_sticker(sticker_path, who)
+        except Exception as e:
+            logger.debug(f"[偷表情包] 获取动画表情原文件失败: {e}")
+
     # 在处理完所有消息类型后检查内容是否为空
     if not original_content:
         logger.info("消息内容为空，已忽略。")
         return
         
     should_process_this_message = False
+    random_reply_with_context = False  # 概率触发的随机接话：是否要读取最近群聊记录
     content_for_handler = original_content 
 
     is_group_chat = is_user_group_chat(who)
@@ -2096,7 +2175,8 @@ def message_listener(msg, chat):
                 logger.info(f"群聊 '{who}' 消息因触发关键词且配置为忽略回复概率，将进行处理。")
             elif random.randint(1, 100) <= GROUP_CHAT_RESPONSE_PROBABILITY:
                 should_process_this_message = True
-                logger.info(f"群聊 '{who}' 消息满足基本触发条件并通过总回复概率 {GROUP_CHAT_RESPONSE_PROBABILITY}%，将进行处理。")
+                random_reply_with_context = True
+                logger.info(f"群聊 '{who}' 消息满足基本触发条件并通过总回复概率 {GROUP_CHAT_RESPONSE_PROBABILITY}%，将读取最近群聊记录后处理。")
             else:
                 should_process_this_message = False
                 logger.info(f"群聊 '{who}' 消息满足基本触发条件，但未通过总回复概率 {GROUP_CHAT_RESPONSE_PROBABILITY}%，将忽略。")
@@ -2104,7 +2184,8 @@ def message_listener(msg, chat):
             # 主动回复概率：与回复概率独立，未@未关键词时按此概率主动回复群友消息
             if GROUP_PROACTIVE_REPLY_PROBABILITY > 0 and random.randint(1, 100) <= GROUP_PROACTIVE_REPLY_PROBABILITY:
                 should_process_this_message = True
-                logger.info(f"群聊 '{who}' 消息未满足基本触发条件，但通过主动回复概率 {GROUP_PROACTIVE_REPLY_PROBABILITY}%，将主动回复。")
+                random_reply_with_context = True
+                logger.info(f"群聊 '{who}' 消息未满足基本触发条件，但通过主动回复概率 {GROUP_PROACTIVE_REPLY_PROBABILITY}%，将读取最近群聊记录后主动回复。")
             else:
                 should_process_this_message = False
                 logger.info(f"群聊 '{who}' 消息 (发送者: {sender}) 未满足任何基本触发条件（全局、@、关键词），将忽略。")
@@ -2114,7 +2195,17 @@ def message_listener(msg, chat):
                 content_for_handler = f"[群聊消息-来自群'{who}'-发送者:{_resolve_sender(who, sender)}]:{processed_group_content}"
             else:
                 content_for_handler = processed_group_content
-            
+
+            # 概率触发的随机接话：先拉取最近群聊记录当上下文，再回复触发的那条消息
+            if random_reply_with_context:
+                context_count = globals().get('GROUP_PROACTIVE_REPLY_CONTEXT_COUNT', 30)
+                history_text = _fetch_group_history_text(who, context_count, getattr(msg, 'local_id', None))
+                if history_text:
+                    content_for_handler = history_text + '\n\n' + content_for_handler
+                    logger.info(f"群聊 '{who}' 随机接话：已附带最近 {context_count} 条群聊记录作为上下文。")
+                else:
+                    logger.info(f"群聊 '{who}' 随机接话：未能读取最近群聊记录，直接回复触发消息。")
+
             if not content_for_handler and at_triggered and not keyword_triggered: 
                 logger.info(f"群聊 '{who}' 中单独 @机器人，处理后内容为空，仍将传递给后续处理器。")
     
@@ -2151,7 +2242,9 @@ def recognize_image_with_moonshot(image_path, is_emoji=False):
         ext = os.path.splitext(str(processed_image_path))[1].lower()
         mime = mime_map.get(ext, 'image/jpeg')
         image_content = None
-        if ext in ('.gif', '.webp', '.bmp'):
+        # 表情包（is_emoji）直接按原文件/原 MIME 发给模型（实测 deepseek-flash 支持 GIF）；
+        # 普通图片仍保留 gif/webp/bmp→JPEG 的兼容转换。
+        if not is_emoji and ext in ('.gif', '.webp', '.bmp'):
             try:
                 from PIL import Image
                 import io
@@ -2182,7 +2275,9 @@ def recognize_image_with_moonshot(image_path, is_emoji=False):
             'Authorization': f'Bearer {image_api_key}',
             'Content-Type': 'application/json'
         }
-        text_prompt = "请用中文描述这张图片的主要内容或主题。不要使用'这是'、'这张'等开头，直接描述。如果有文字，请包含在描述中。" if not is_emoji else "请用中文简洁地描述这个聊天窗口最后一张表情包所表达的情绪、含义或内容。如果表情包含文字，请一并描述。注意：1. 只描述表情包本身，不要添加其他内容 2. 不要出现'这是'、'这个'等词语"
+        text_prompt = ("请用中文描述这张图片的主要内容或主题。不要使用'这是'、'这张'等开头，直接描述。如果有文字，请包含在描述中。"
+                       if not is_emoji else
+                       "请用中文简洁地描述这张表情包所表达的情绪、含义或内容。如果表情包里有文字，请一并描述。注意：1. 只描述表情包本身，不要添加其他内容 2. 不要出现'这是'、'这个'等词语")
         data = {
             "model": image_model,
             "messages": [
@@ -2203,8 +2298,6 @@ def recognize_image_with_moonshot(image_path, is_emoji=False):
         recognized_text = result['choices'][0]['message']['content']
 
         if is_emoji:
-            if "最后一张表情包" in recognized_text:
-                recognized_text = recognized_text.split("最后一张表情包", 1)[1].strip()
             recognized_text = "发送了表情包：" + recognized_text
         else:
             recognized_text = "发送了图片：" + recognized_text
@@ -2226,6 +2319,168 @@ def recognize_image_with_moonshot(image_path, is_emoji=False):
         logger.error(f"调用AI识别图片失败: {str(e)}", exc_info=True)
         can_send_messages = True
         return ""
+
+# ==================== 偷表情包（微信动画表情原文件自动收藏） ====================
+
+_sticker_steal_lock = threading.Lock()
+_sticker_memory = None  # 独立的“表情包偷取记忆”（sticker_steal.StickerStealMemory）
+
+
+def _get_sticker_memory():
+    """惰性加载独立的偷取记忆（JSON 文件）。
+
+    记忆为空时（首次启用/文件被删）自动从现有 emojis/ 表情库重建，
+    保证启用前已经攒下的表情也不会被重复偷。
+    """
+    global _sticker_memory
+    with _sticker_steal_lock:
+        if _sticker_memory is None:
+            rel = str(globals().get('STICKER_STEAL_MEMORY_FILE', '')
+                      or 'Memory_Temp/sticker_steal_memory.json')
+            path = rel if os.path.isabs(rel) else os.path.join(root_dir, rel)
+            memory = sticker_steal.StickerStealMemory(path)
+            if memory.empty():
+                try:
+                    added = memory.rebuild_from_files(os.path.join(root_dir, EMOJI_DIR))
+                    memory.save()
+                    logger.info('[偷表情包] 偷取记忆已初始化（%d 条，来源：现有表情库）', added)
+                except Exception as e:
+                    logger.debug('[偷表情包] 重建偷取记忆失败: %s', e)
+            _sticker_memory = memory
+        return _sticker_memory
+
+
+def _sticker_vision_text(image_path, text_prompt):
+    """偷表情包分类专用调用：把表情包原文件按真实 MIME 发给视觉模型，让它只做"读图+分类"。
+
+    独立调用，不挂任何人设 prompt、不产生回复；优先使用 STICKER_CLASSIFY_* 专用 API，
+    未配置时回退到图片识别 API。实测 deepseek-flash 可直接识别 GIF，故不做 GIF→JPEG 转换。
+    """
+    mime_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp'}
+    ext = os.path.splitext(str(image_path))[1].lower()
+    mime = mime_map.get(ext, 'image/jpeg')
+    with open(image_path, 'rb') as img_file:
+        image_content = base64.b64encode(img_file.read()).decode('utf-8')
+    # 优先用"偷表情包分类专用 API"（独立于人设/聊天模型，只做读图分类）；
+    # 三项没配齐就回退到图片识别 API。
+    api_key = str(globals().get('STICKER_CLASSIFY_API_KEY') or '').strip()
+    base_url = str(globals().get('STICKER_CLASSIFY_BASE_URL') or '').strip().rstrip('/')
+    image_model = str(globals().get('STICKER_CLASSIFY_MODEL') or '').strip()
+    if not (api_key and base_url and image_model):
+        if ENABLE_IMAGE_USE_CHAT_API:
+            api_key, base_url, image_model = DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
+        else:
+            api_key, base_url, image_model = MOONSHOT_API_KEY, MOONSHOT_BASE_URL, MOONSHOT_MODEL
+    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+    data = {
+        'model': image_model,
+        'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{image_content}'}},
+            {'type': 'text', 'text': text_prompt},
+        ]}],
+        'temperature': 0,
+    }
+    response = requests.post(f'{base_url}/chat/completions', headers=headers, json=data, timeout=60)
+    response.raise_for_status()
+    result = response.json()
+    return (result.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+
+
+def classify_sticker_mood(image_path, categories):
+    """让视觉模型从 categories 里挑一个最贴切的心情，失败返回 'misc'。"""
+    cats = list(categories) or ['happy']
+    prompt = ('这是一张聊天里发的表情包（meme）。请从这些心情里选一个最贴切的：%s。'
+              '只输出其中一个英文单词（原样照抄），不要标点、不要解释。' % '、'.join(cats))
+    try:
+        raw = _sticker_vision_text(image_path, prompt)
+    except Exception as e:
+        logger.warning(f'[偷表情包] 心情分类失败，按 misc 处理: {e}')
+        raw = ''
+    return sticker_steal.pick_mood(raw, cats, default='misc')
+
+
+def _steal_sticker_worker(data, extension, digest, who, source_id='', dhash_value=''):
+    """后台线程：查偷取记忆 → 判心情 → 复制进 emojis/<心情>/ → 记入偷取记忆。"""
+    try:
+        memory = _get_sticker_memory()
+        hit, feature = memory.match(sha256=digest, source=source_id, dhash_value=dhash_value)
+        if hit:
+            logger.info('[偷表情包] 已偷过（命中 %s），跳过：%s', feature, who)
+            return
+        base = os.path.join(root_dir, EMOJI_DIR)
+        categories = sticker_steal.discover_categories(base, default='happy')
+        temp_dir = os.path.join(root_dir, MEMORY_TEMP_DIR)
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, 'sticker_steal_%s%s' % (digest[:8], extension or '.png'))
+        with open(temp_path, 'wb') as handle:
+            handle.write(data)
+        try:
+            mood = classify_sticker_mood(temp_path, categories)
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        target = sticker_steal.save_stolen(
+            data, extension, mood, base, digest,
+            now_token=datetime.now().strftime('%Y%m%d_%H%M%S'),
+        )
+        try:
+            relative = os.path.relpath(target, base).replace(os.sep, '/')
+        except Exception:
+            relative = os.path.basename(target)
+        memory.add({
+            'sha256': digest,
+            'source': source_id,
+            'dhash': dhash_value,
+            'size': len(data),
+            'path': relative,
+            'mood': mood,
+            'from': who,
+            'at': datetime.now().isoformat(timespec='seconds'),
+        })
+        logger.info('[偷表情包] 已收藏 %s 的表情包 → %s（记忆共 %d 条）',
+                    who, os.path.relpath(target, root_dir), len(memory))
+        # 只在 hdsi 运行时已经存在时才刷新贴纸库：hdsi 关闭时不要为了偷表情包
+        # 去创建整个剧场引擎（构造运行时会启动后台扫描/推进任务）。
+        runtime = globals().get('_hdsi_runtime')
+        if runtime is not None:
+            try:
+                runtime.refresh_stickers()
+            except Exception as e:
+                logger.debug('[偷表情包] 刷新贴纸库失败: %s', e)
+    except Exception as e:
+        logger.warning('[偷表情包] 收藏失败: %s', e)
+
+
+def _maybe_steal_sticker(image_path, who):
+    """检测到动画表情原文件时调用：算特征 → 查偷取记忆 → 未偷过才交给后台线程分类收藏。"""
+    if not bool(globals().get('THEATER_STICKER_STEAL_ENABLED', True)):
+        return
+    try:
+        with open(str(image_path), 'rb') as handle:
+            data = handle.read()
+    except OSError:
+        return
+    if not data:
+        return
+    extension = os.path.splitext(str(image_path))[1].lower()
+    digest = hashlib.sha256(data).hexdigest()
+    source_id = sticker_steal.source_id_from_path(image_path)
+    dhash_value = sticker_steal.dhash(data)
+    try:
+        memory = _get_sticker_memory()
+        hit, feature = memory.match(sha256=digest, source=source_id, dhash_value=dhash_value)
+        if hit:
+            logger.info('[偷表情包] 已偷过（命中 %s），跳过：%s', feature, who)
+            return
+    except Exception as e:
+        logger.debug('[偷表情包] 读取偷取记忆失败，改为直接收藏: %s', e)
+    threading.Thread(target=_steal_sticker_worker,
+                     args=(data, extension, digest, who, source_id, dhash_value),
+                     daemon=True).start()
+
 
 def handle_emoji_message(msg, who):
     global emoji_timer
@@ -2594,28 +2849,45 @@ def handle_wxauto_message(msg, who):
         # 检查是否为动画表情
         elif msg.type in ('emotion'):
             if ENABLE_EMOJI_RECOGNITION:
-                # 三次重试机制截图表情
+                # 优先拿表情包原文件：WeFlow 本地监听会给出 mediaLocalPath/mediaUrl
+                # （gif/png/jpg 原图），直接把原文件交给模型识别，比截聊天窗口清楚得多。
                 img_path = None
+                sticker_original = False
                 for attempt in range(3):
                     try:
-                        img_path = msg.capture() # 截图
-                        if img_path:
-                            logger.info(f"表情截图成功 (第{attempt + 1}次尝试): {img_path}")
+                        candidate = msg.download()
+                        if candidate and os.path.exists(str(candidate)):
+                            img_path = candidate
+                            sticker_original = True
+                            logger.info(f"表情包原文件获取成功 (第{attempt + 1}次尝试): {img_path}")
                             break
-                        else:
-                            logger.warning(f"表情截图失败 (第{attempt + 1}次尝试)")
+                        logger.warning(f"表情包原文件获取返回空 (第{attempt + 1}次尝试)")
                     except Exception as e:
-                        logger.warning(f"表情截图异常 (第{attempt + 1}次尝试): {e}")
-                    
-                    if attempt < 2:  # 不是最后一次尝试
-                        time.sleep(0.5)  # 等待0.5秒后重试
-                
+                        logger.warning(f"表情包原文件获取异常 (第{attempt + 1}次尝试): {e}")
+                    if attempt < 2:
+                        time.sleep(0.5)
+
+                # 只有拿不到原文件时才退回截图（截图只用于识别，不会被收藏）
+                if not img_path:
+                    for attempt in range(3):
+                        try:
+                            img_path = msg.capture()
+                            if img_path:
+                                logger.info(f"表情包原文件不可用，退回截图 (第{attempt + 1}次尝试): {img_path}")
+                                break
+                            logger.warning(f"表情截图失败 (第{attempt + 1}次尝试)")
+                        except Exception as e:
+                            logger.warning(f"表情截图异常 (第{attempt + 1}次尝试): {e}")
+                        if attempt < 2:
+                            time.sleep(0.5)
+
                 if img_path:
                     is_emoji = True
                     processed_content = None # 标记为None，稍后会被识别结果替换
-                    logger.info("检测到动画表情，准备截图识别...")
+                    logger.info("检测到动画表情，准备识别（原文件优先）...")
+                    # 偷表情包的收藏已在 message_listener 入口完成（不受 hdsi/回复门控影响）
                 else:
-                    logger.error("表情截图失败，已重试3次")
+                    logger.error("表情包原文件与截图均获取失败，已重试3次")
             else:
                 clean_up_temp_files() # 清理可能的临时文件
                 logger.info("检测到动画表情，但表情识别功能已禁用。")

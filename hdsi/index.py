@@ -69,7 +69,7 @@ def build_model_provider(*, api_key: str, base_url: str, model: str, label: str 
         'useForCompaction': True,
         'useForAlter': True,
         'useForEmbedding': bool(api_key),
-        'useForStickers': False,
+        'useForStickers': True,  # 本地表情包库要靠带视觉的贴纸描述器把新素材激活
         'useForVision': False,
     })
     return provider
@@ -162,6 +162,14 @@ class HdsiRuntime:
                 self.logger.warning('HDSI 创建主剧本失败：%s', error)
                 return None
         if character and story:
+            # 保险：主剧本若被“单 active 剧本”清理逻辑归档，收到消息时自动恢复，
+            # 否则 receive 会因为 status != 'active' 静默返回（表现为“hdsi 调不出来”）。
+            if str(story.get('status') or '') == 'archived':
+                try:
+                    story = self.service.set_status(story, 'active')
+                    self.logger.warning('HDSI 主剧本曾被归档，收到消息后已自动恢复 active：%s', story.get('id'))
+                except Exception as error:  # noqa: BLE001
+                    self.logger.warning('HDSI 恢复归档主剧本失败：%s', error)
             patch = {
                 'character': {
                     'name': str(character.get('name') or story['setting']['character']['name']),
@@ -178,6 +186,13 @@ class HdsiRuntime:
             except Exception as error:  # noqa: BLE001
                 self.logger.warning('HDSI 更新角色设定失败：%s', error)
         return story
+
+    def refresh_stickers(self) -> None:
+        """重新扫描本地贴纸库，登记新素材（偷来的表情包靠这个进入模型目录）。"""
+        try:
+            self.service.scan_sticker_library()
+        except Exception:
+            self.logger.exception('HDSI 贴纸库扫描失败')
 
     # ---- 入口 ----
     def receive(self, session: InboundSession, character: Optional[Dict[str, Any]] = None) -> None:
